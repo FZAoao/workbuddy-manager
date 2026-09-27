@@ -776,9 +776,15 @@ export interface TaskRunStatus {
   error: string;
   /** 输出尾部（脚本按行打印，后端只保留最近若干行） */
   lines: string[];
+  /** 本次运行从脚本 stdout 抓到的中奖记录（开学季抽奖） */
+  prizes?: {uid: string; label: string; prize_code: string;
+            prize_type: string; credit: number}[];
   /** 上游脚本与账号目录是否就位；false 时 unavailable_reason 说明原因与做法 */
   available: boolean;
   unavailable_reason: string;
+  /** 开学季脚本（school_open_day_2026.py）是否就位，独立于上面的 available */
+  school_available?: boolean;
+  school_unavailable_reason?: string;
   /** 定时领奖配置（只有幂等的认领，不含点亮） */
   schedule: {enabled?: boolean; hours?: number[]};
 }
@@ -1120,4 +1126,70 @@ export interface CreatedRedPacket {
   created_at: number;
   expires_at: number;
   keys: ApiKey[];
+}
+
+/* ── 在线导入账号（拖拽 auth JSON）────────────────────── */
+
+/** 单个文件的导入结果（成功或失败原因）。 */
+export interface ImportResult {
+  file: string;
+  ok: boolean;
+  /** 失败原因（ok=false 时有值） */
+  error?: string;
+  uid?: string;
+  nickname?: string;
+  realm?: 'cn' | 'global';
+  /** 落盘后的文件名（ok=true 时有值） */
+  saved_file?: string;
+  /** true = 覆盖了同名账号（同一 uid 之前已存在） */
+  updated?: boolean;
+}
+
+export interface ImportResponse {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: ImportResult[];
+  upstream: {id: number | null; name: string};
+}
+
+/* ── 开学季抽奖中奖记录 ──────────────────────────────── */
+
+/** 奖品类型：credit 积分 / voucher 实物券 / other 未知奖码 */
+export type LotteryPrizeType = 'credit' | 'voucher' | 'other';
+/** 核销状态：pending 待核销 / redeemed 已核销 / void 已作废 */
+export type LotteryPrizeStatus = 'pending' | 'redeemed' | 'void';
+
+export interface LotteryPrize {
+  id: number;
+  ts: number;
+  uid: string;
+  nickname: string;
+  prize_code: string;
+  /** 奖品展示名（脚本打印的中文标签，如「瑞幸咖啡15元券」） */
+  label: string;
+  prize_type: LotteryPrizeType;
+  /** 积分奖的数量（非积分奖为 0） */
+  credit: number;
+  /** 来源：school / task_runner / manual */
+  source: string;
+  status: LotteryPrizeStatus;
+  note: string;
+}
+
+export interface LotteryPrizeStats {
+  total: number;
+  total_credit: number;
+  by_type: Record<string, number>;
+  by_status: Record<string, number>;
+  voucher_total: number;
+  voucher_redeemed: number;
+}
+
+export interface LotteryPrizeResponse {
+  items: LotteryPrize[];
+  total: number;
+  stats: LotteryPrizeStats;
+  types: Record<string, string>;
+  statuses: Record<string, string>;
 }

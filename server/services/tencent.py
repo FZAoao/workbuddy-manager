@@ -367,6 +367,167 @@ def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, b
     return target.name, existed
 
 
+def parse_auth_json(raw: object, *, default_nickname: str = '') -> dict:
+    """把一份「来源未知的账号授权 JSON」归一化成落盘所需的字段。
+
+    支持的形态（线上实测见到的都收）：
+      1. workbuddy2api 落盘格式：
+         `{"account": {"uid","enterpriseId","nickname"}, "auth": {"accessToken",…},
+           "device_token": "…"}`
+      2. 裸单条：`{"uid","access_token","refresh_token","nickname","realm","domain"}`
+      3. 裸数组：`[{…}, {…}]`（取第一项——面板一次导入一个账号，多条应拆开上传）
+      4. 上游 login.sh 的 token 响应包壳：`{"data": {"accessToken",…}}`
+
+    归一化输出（喂给 `write_auth_file`）：
+      `{uid, access_token, refresh_token, expires_at, nickname, enterprise_id,
+        domain, realm, device_token}`
+
+    realm / domain 的处理与 `convert-auths.sh` 的「内容检测」同口径，但**以文件
+    里已有的为准**：显式 realm 优先；其次按 domain（workbuddy.ai → global）；
+    都没有再按昵称/手机号猜测（11 位 1 开头手机号 → cn，其余 → global）。
+    这样既有明确标注的账号不会被猜错，没标注的也能落到正确的一侧。
+
+    uid / accessToken 缺失时抛 ValueError（调用方据此拒绝该文件并说明原因）。
+    """
+    # ① 数组：取第一项（一次导入一个账号；多条应分别上传）
+    if isinstance(raw, list):
+        if not raw:
+            raise ValueError('文件里是空数组，没有账号')
+        raw = raw[0]
+    if not isinstance(raw, dict):
+        raise ValueError('不是有效的 JSON 对象')
+
+    # ② 解包 data / result 层（login.sh 的响应包壳）。外层可能同时带着 uid /
+    # nickname（如 `{"uid":..., "data": {"accessToken":...}}`），所以解包后把
+    # 内层缺的这几个键从外层补回来，而不是整个丢掉外层。
+    outer = raw
+    for key in ('data', 'result'):
+        inner = raw.get(key)
+        if isinstance(inner, dict) and (
+                inner.get('accessToken') or inner.get('access_token')):
+            merged = dict(inner)
+            for k in ('uid', 'userId', 'user_id', 'nickname', 'nick',
+                      'enterpriseId', 'enterprise_id', 'domain', 'realm',
+                      'device_token', 'deviceToken', 'refreshToken',
+                      'refresh_token', 'expiresAt', 'expires_at'):
+                if k not in merged and k in outer:
+                    merged[k] = outer[k]
+            raw = merged
+            break
+
+    acct = raw.get('account') if isinstance(raw.get('account'), dict) else {}
+    auth = raw.get('auth') if isinstance(raw.get('auth'), dict) else {}
+
+    uid = str(
+        acct.get('uid') or raw.get('uid') or raw.get('user_id')
+        or raw.get('userId') or ''
+    ).strip()
+    access_token = str(
+        auth.get('accessToken') or auth.get('access_token')
+        or raw.get('accessToken') or raw.get('access_token')
+        or raw.get('token') or ''
+    ).strip()
+    if not uid:
+        raise ValueError('缺少 uid（账号标识）')
+    if not access_token:
+        raise ValueError('缺少 accessToken')
+
+    refresh_token = str(
+        auth.get('refreshToken') or auth.get('refresh_token')
+        or raw.get('refreshToken') or raw.get('refresh_token') or ''
+    ).strip()
+
+    nickname = str(
+        acct.get('nickname') or raw.get('nickname') or raw.get('nick') or ''
+    ).strip() or default_nickname
+
+    enterprise_id = str(
+        acct.get('enterpriseId') or acct.get('enterprise_id')
+        or raw.get('enterpriseId') or raw.get('enterprise_id') or ''
+    ).strip()
+
+    domain = str(
+        auth.get('domain') or raw.get('domain') or ''
+    ).strip()
+
+    # 有效期：已有 expiresAt 就用；否则给一年（与 convert-auths.sh 同口径，
+    # 后续保活/刷新会把它纠正到真实值）。
+    expires_at = auth.get('expiresAt') or raw.get('expiresAt') or raw.get('expires_at')
+    try:
+        expires_at = int(expires_at) if expires_at else 0
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at <= 0:
+        expires_at = int(time.time()) + 365 * 86400
+
+    # realm：显式 > domain 推导 > 昵称猜测（见 docstring）
+    explicit = str(auth.get('realm') or raw.get('realm') or '').strip()
+    if explicit.lower() in ('cn', 'global'):
+        realm = explicit.lower()
+    elif domain:
+        realm = resolve_realm(None, domain)
+    else:
+        realm = 'cn' if _looks_cn_account(nickname) else 'global'
+    # domain 与 realm 保持一致：显式 domain 优先，否则按 realm 补默认域
+    if not domain:
+        domain = ('copilot.tencent.com' if realm == 'cn' else 'www.workbuddy.ai')
+
+    device_token = str(
+        raw.get('device_token') or raw.get('deviceToken') or ''
+    ).strip()
+
+    return {
+        'uid': uid,
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'expires_at': expires_at,
+        'nickname': nickname,
+        'enterprise_id': enterprise_id,
+        'domain': domain,
+        'realm': realm,
+        'device_token': device_token,
+    }
+
+
+def _looks_cn_account(nickname: str) -> bool:
+    """无 realm / domain 时，按昵称猜版本：11 位 1 开头手机号 → 国内版。
+
+    与 `convert-auths.sh` 的判据一致（那里也只看昵称/手机号形态）。猜错时用户
+    仍可在导入后手动改，且绝大多数国内号昵称就是手机号。
+    """
+    nick = (nickname or '').strip()
+    if nick.isdigit() and len(nick) == 11 and nick.startswith('1'):
+        return True
+    return False
+
+
+def write_imported_auth(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
+    """把归一化后的导入账号落盘，**保留已有的 device_token**。
+
+    与 `write_auth_file` 的差别：后者按登录响应重建整份文件、device_token 从
+    旧文件读；导入的账号可能**自带** device_token（在 `account['device_token']`），
+    这里优先用它，没有才回退读旧文件。其余落盘逻辑（uid 校验、原子写、realm
+    用 resolve_realm）与 `write_auth_file` 完全一致，直接复用它即可。
+    """
+    base = auth_dir or config.AUTH_DIR
+    target = base / f"workbuddy-{account['uid']}.json"
+    incoming_dt = str(account.get('device_token') or '').strip()
+
+    filename, existed = write_auth_file(account, auth_dir)
+
+    # write_auth_file 只保留旧文件的 device_token；导入自带的要补回去。
+    if incoming_dt:
+        try:
+            data = json.loads(target.read_text(encoding='utf-8'))
+            if isinstance(data, dict) and data.get('device_token') != incoming_dt:
+                data['device_token'] = incoming_dt
+                _atomic_write_json(target, data)
+        except Exception:  # noqa: BLE001
+            # 补写失败不影响账号本体（device_token 缺失只是降级风控形态）
+            pass
+    return filename, existed
+
+
 async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     """用 refreshToken 换新的 accessToken（issue #40）。
 

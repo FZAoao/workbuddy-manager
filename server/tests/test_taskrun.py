@@ -125,7 +125,7 @@ class AvailabilityTest(unittest.TestCase):
         self.assertIn('workbuddy2api', why, '要说清这是上游的脚本')
 
     def test_refuses_to_start_when_unavailable(self) -> None:
-        with mock.patch.object(taskrun, 'available', lambda: (False, '脚本不在')):
+        with mock.patch.object(taskrun, 'available', lambda *a, **k: (False, '脚本不在')):
             ok, msg = taskrun.start('claim', 'ALL')
         self.assertFalse(ok)
         self.assertIn('脚本不在', msg)

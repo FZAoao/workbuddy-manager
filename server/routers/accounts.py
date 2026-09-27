@@ -9,7 +9,7 @@ import shutil
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 
 from .. import config, db, security, upstreamsvc
 from ..services import (
@@ -1100,19 +1100,32 @@ async def task_run_start(
 ) -> dict:
     """启动一次执行。body: {mode, target}。
 
-    `full`（点亮 + 领奖）会伪造活跃上报，因此要求显式传 `confirm: true` ——
-    与「领奖」区分开，避免手滑点到风险最高的那个。
+    mode 取值：
+      · preview / claim / full —— 成长任务（task_runner.py）；
+      · school / school-lottery —— 开学季任务 / 只抽奖（school_open_day_2026.py）。
+
+    `full`（点亮）与 `school`（开学季任务）都会发起真实写请求（伪造活跃上报），
+    因此要求显式传 `confirm: true` —— 与幂等的「领奖」区分开，避免手滑点到
+    风险最高的那两个。`school-lottery` 只抽奖（会消耗抽奖次数，属不可逆），
+    也要求确认。
     """
     mode = str(body.get('mode') or '').strip()
     target = str(body.get('target') or 'ALL').strip() or 'ALL'
-    if mode not in ('preview', 'claim', 'full'):
-        raise HTTPException(status_code=400, detail='模式只能是 preview / claim / full')
-    if mode == 'full' and body.get('confirm') is not True:
+    if mode not in ('preview', 'claim', 'full', 'school', 'school-lottery'):
         raise HTTPException(
             status_code=400,
-            detail='「点亮任务」会向腾讯发送活跃上报（造画布、连发对话等），'
-                   '请先确认：该操作有风控风险，建议先用「预览」看清将要做的事。',
-        )
+            detail='模式只能是 preview / claim / full / school / school-lottery')
+    if mode in ('full', 'school', 'school-lottery') and body.get('confirm') is not True:
+        if mode == 'full':
+            detail = ('「点亮任务」会向腾讯发送活跃上报（造画布、连发对话等），'
+                      '请先确认：该操作有风控风险，建议先用「预览」看清将要做的事。')
+        elif mode == 'school':
+            detail = ('「开学季任务」会向腾讯发送活跃上报与领奖请求（有风控风险），'
+                      '请先确认；只想清空抽奖次数可改用「开学季抽奖」。')
+        else:
+            detail = ('「开学季抽奖」会消耗账号的抽奖次数（不可逆），'
+                      '请先确认：中奖记录会保存在「中奖记录」页。')
+        raise HTTPException(status_code=400, detail=detail)
     # 走线程池版本：start() 内部会解析脚本路径（脚本缺失时还要 fork docker
     # 提取，最长 60 秒），本接口是 async，同步跑它会冻住整个事件循环——
     # 连带把对外网关一起卡住。
@@ -1164,6 +1177,94 @@ def upstream_logs(limit: int = 200, user: dict = Depends(security.current_user))
         if any(k in ln.lower() for k in keywords)
     ]
     return {'available': lines != [], 'lines': interesting, 'total': len(lines)}
+
+
+# ── 开学季抽奖中奖记录 ────────────────────────────────────
+#
+# 数据来源：面板触发开学季脚本时，taskrun 把脚本 stdout 里的中奖行抓出来落库
+# （见 taskrun._capture_lottery / _record_lottery）。上游调度器不转发子进程
+# stdout，所以容器日志里没有这些记录——只能这样采集。
+
+_LOTTERY_PRIZE_TYPES = ('credit', 'voucher', 'other')
+_LOTTERY_STATUSES = ('pending', 'redeemed', 'void')
+
+
+@router.get('/lottery-prizes')
+def lottery_prizes(
+    limit: int = 200,
+    offset: int = 0,
+    status: str | None = None,
+    prize_type: str | None = None,
+    uid: str | None = None,
+    days: int | None = None,
+    user: dict = Depends(security.current_user),
+) -> dict:
+    """开学季转盘中奖记录（分页）。
+
+    只读，任何已登录用户可看（与任务记录同权限口径）；改状态 / 删除仅管理员。
+    昵称按 uid 前缀解析（脚本只打 uid 前 8 位，与 task_logs 同口径）。
+    """
+    st = status if status in _LOTTERY_STATUSES else None
+    pt = prize_type if prize_type in _LOTTERY_PRIZE_TYPES else None
+    items = db.list_lottery_prizes(
+        limit=limit, offset=offset, status=st, prize_type=pt, uid=uid, days=days)
+    total = db.count_lottery_prizes(
+        status=st, prize_type=pt, uid=uid, days=days)
+    resolve_nick = _nickname_resolver()
+    for it in items:
+        if not it.get('nickname'):
+            it['nickname'] = resolve_nick(str(it.get('uid') or ''))
+    return {
+        'items': items,
+        'total': total,
+        'stats': db.lottery_prize_stats(days=days),
+        # 奖品类型 / 状态的展示名，供前端字典兜底（与 task-logs 的 kinds 同款）
+        'types': {'credit': '积分', 'voucher': '实物券', 'other': '其它'},
+        'statuses': {'pending': '待核销', 'redeemed': '已核销', 'void': '已作废'},
+    }
+
+
+@router.patch('/lottery-prizes/{prize_id}')
+def lottery_prize_update(
+    prize_id: int,
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """标记一条中奖记录的核销状态 / 写备注。
+
+    只允许改 status 与 note：奖品本体是脚本从腾讯回读的**事实**，不该被手工
+    改写（改了台账与腾讯对不上，反而更难查）。status: pending/redeemed/void。
+    """
+    try:
+        ok = db.update_lottery_prize(
+            prize_id,
+            status=body.get('status') if 'status' in body else None,
+            note=body.get('note') if 'note' in body else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ok:
+        raise HTTPException(status_code=404, detail='记录不存在或没有可更新的字段')
+    return {'ok': True}
+
+
+@router.delete('/lottery-prizes/{prize_id}')
+def lottery_prize_delete(
+    prize_id: int,
+    user: dict = Depends(security.require_session_admin),
+) -> dict:
+    ok = db.delete_lottery_prize(prize_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail='记录不存在')
+    return {'ok': True}
+
+
+@router.post('/lottery-prizes/clear')
+def lottery_prizes_clear(
+    user: dict = Depends(security.require_session_admin),
+) -> dict:
+    db.clear_lottery_prizes()
+    return {'ok': True}
 
 
 @router.post('/accounts/{filename}/test')
@@ -1424,6 +1525,102 @@ async def restart(upstream_id: int | None = Query(None),
     group = _group(upstream_id)
     ok, message = await reload.restart_now(upstream=_reload_target(group))
     return {'ok': ok, 'message': message}
+
+
+# 一次导入允许的最大文件数与单文件字节数。上限是防滥用（未认证不可达，
+# 但仍要防止一次点选上千个文件把内存/磁盘打满）。
+_IMPORT_MAX_FILES = 200
+_IMPORT_MAX_BYTES = 512 * 1024
+
+
+@router.post('/accounts/import')
+async def account_import(
+    files: list[UploadFile] = File(...),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """**在线导入**账号授权 JSON（拖拽 / 选择文件，无需手工上传到服务器）。
+
+    与「扫码添加」并列的第二种加号方式：把从别处拿到的 auth JSON 直接拖进
+    弹窗即可。每个文件独立处理，逐个返回成功 / 失败原因，**不因一个坏文件
+    中断整批**——用户常常一次拖一批，其中夹杂着格式不对的很正常。
+
+    支持的 JSON 形态见 `tencent.parse_auth_json`（workbuddy2api 落盘格式 /
+    裸单条 / 数组 / login.sh 响应包壳）。落盘走 `tencent.write_imported_auth`：
+    uid 字符集校验、realm 用 resolve_realm（不含逃生门）、原子写、保留
+    device_token，与扫码路径同一套。
+
+    同名账号（同一 uid）会被**覆盖更新**（existed=True），并在结果里如实标注。
+    """
+    group = _group(upstream_id)
+    base_dir = _require_dir(group)
+    if not files:
+        raise HTTPException(status_code=400, detail='没有收到任何文件')
+    if len(files) > _IMPORT_MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f'一次最多导入 {_IMPORT_MAX_FILES} 个文件（收到 {len(files)} 个）',
+        )
+
+    results: list[dict] = []
+    ok_uids: list[str] = []
+    for uf in files:
+        name = str(uf.filename or 'account.json')
+        try:
+            raw_bytes = await uf.read()
+        except Exception as exc:  # noqa: BLE001
+            results.append({'file': name, 'ok': False, 'error': f'读取失败：{exc}'})
+            continue
+        if len(raw_bytes) > _IMPORT_MAX_BYTES:
+            results.append({
+                'file': name, 'ok': False,
+                'error': f'文件过大（上限 {_IMPORT_MAX_BYTES // 1024} KB）',
+            })
+            continue
+        try:
+            parsed_json = json.loads(raw_bytes.decode('utf-8-sig'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            results.append({'file': name, 'ok': False, 'error': f'不是有效的 JSON：{exc}'})
+            continue
+        try:
+            account = tencent.parse_auth_json(parsed_json)
+        except ValueError as exc:
+            results.append({'file': name, 'ok': False, 'error': str(exc)})
+            continue
+        try:
+            filename, existed = tencent.write_imported_auth(account, base_dir)
+        except ValueError as exc:
+            results.append({'file': name, 'ok': False, 'error': str(exc)})
+            continue
+        except OSError as exc:
+            results.append({
+                'file': name, 'ok': False,
+                'error': (f'写入失败：{exc}。请检查 {base_dir} 的目录权限'
+                          '（容器部署见 compose 里 chown 10001:10001 的说明）'),
+            })
+            continue
+        ok_uids.append(account['uid'])
+        results.append({
+            'file': name, 'ok': True,
+            'uid': account['uid'],
+            'nickname': account.get('nickname') or '',
+            'realm': account.get('realm') or 'cn',
+            'saved_file': filename,
+            'updated': existed,
+        })
+
+    # 让上游收录新账号：先等热加载、超时才重启（一次调用把整批 uid 纳入判断）。
+    for uid in ok_uids:
+        reload.request_reload_or_restart(uid, upstream=_reload_target(group))
+
+    succeeded = sum(1 for r in results if r.get('ok'))
+    return {
+        'total': len(results),
+        'succeeded': succeeded,
+        'failed': len(results) - succeeded,
+        'results': results,
+        'upstream': {'id': group['id'], 'name': group['name']},
+    }
 
 
 def _fallback_why(bit_code: str, disabled: bool, group: dict | None = None) -> str:

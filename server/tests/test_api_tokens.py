@@ -295,6 +295,10 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         # 账号分组互转：把账号文件在分组的目录之间移动——等于改「这个号属于哪个
         # 池」，与删账号同级（都会改变池的构成），只对会话开放。
         'POST /api/accounts/{filename}/move',
+        # 开学季中奖记录：删除 / 清空都是**不可逆**的抹痕迹动作，与
+        # `POST /api/task-logs/clear`、`DELETE /api/accounts/{filename}` 同级。
+        'DELETE /api/lottery-prizes/{prize_id}',
+        'POST /api/lottery-prizes/clear',
     }
     # 写方法但只要求「已登录」——只读令牌也能调。必须逐个有理由。
     ANY_LOGGED_IN = {

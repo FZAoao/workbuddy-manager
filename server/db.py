@@ -227,6 +227,39 @@ CREATE TABLE IF NOT EXISTS task_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_task_logs_ts ON task_logs(ts);
 
+-- 开学季幸运大转盘的中奖记录（券 / 积分）。
+--
+-- 为什么要单独存：上游脚本 `school_open_day_2026.py` 抽奖时只把中奖信息
+-- **打在它自己的 stdout 里**，而调度器 `runScript` 不转发子进程输出（容器
+-- 日志里只有一行 `school: ok (...)`）——所以中奖记录**在容器日志里根本不存在**，
+-- 采集器无从解析。用户需要「我到底中了哪些券」的长期台账，只能在面板自己
+-- 触发脚本时把它的 stdout 接住、解析后落库。
+--
+-- 中奖信息里的**券码不在脚本输出里**（脚本只打印券名，如「瑞幸咖啡15元券」），
+-- 券码/核销入口在腾讯活动页，所以本表是「中了什么奖」的台账，不是兑奖凭证。
+--
+-- dedup_key 由「脚本结束时间戳 + 账号 + 奖码 + 该账号第几抽」生成：同一轮
+-- 脚本重复解析（例如前端轮询状态多次）不会重复入库，而不同轮的同一奖码会
+-- 各自留痕（那是真的又中了一次）。
+CREATE TABLE IF NOT EXISTS lottery_prizes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,
+  uid        TEXT    NOT NULL DEFAULT '',
+  nickname   TEXT    NOT NULL DEFAULT '',
+  prize_code TEXT    NOT NULL DEFAULT '',
+  label      TEXT    NOT NULL DEFAULT '',
+  -- credit（积分）/ voucher（实物券）/ other（未知奖码）
+  prize_type TEXT    NOT NULL DEFAULT 'other',
+  credit     INTEGER NOT NULL DEFAULT 0,
+  -- 来源：school（开学季转盘）/ task_runner（成长中心转盘）/ manual（手动录入）
+  source     TEXT    NOT NULL DEFAULT 'school',
+  -- pending 待核销 / redeemed 已核销 / void 已作废
+  status     TEXT    NOT NULL DEFAULT 'pending',
+  note       TEXT    NOT NULL DEFAULT '',
+  dedup_key  TEXT    NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_lottery_ts ON lottery_prizes(ts);
+
 -- 管理面**作用域化 API Token**（见 docs/api-tokens.md）。
 --
 -- 与 api_keys（数据面网关密钥）是**两套东西**：api_keys 只授权模型调用，
@@ -1194,6 +1227,191 @@ def task_log_stats(days: int | None = None) -> dict:
 
 def clear_task_logs() -> None:
     execute('DELETE FROM task_logs')
+
+
+# ── 开学季抽奖中奖记录 ───────────────────────────────────
+#
+# 见 SCHEMA 里 lottery_prizes 的说明：上游脚本的抽奖 stdout 不进容器日志，
+# 只能由面板触发脚本时接住、解析后落库。
+_STATUS_VALUES = ('pending', 'redeemed', 'void')
+
+
+def add_lottery_prizes(entries: list[dict]) -> int:
+    """批量写入中奖记录，返回**实际新增**条数（dedup_key 重复的忽略）。
+
+    与 add_task_logs 同一套做法：`INSERT OR IGNORE` + `total_changes` 差值，
+    因此前端轮询状态反复解析同一轮输出也不会重复入库。
+    """
+    if not entries:
+        return 0
+    rows = [
+        (
+            int(e.get('ts') or 0),
+            str(e.get('uid') or '')[:64],
+            _clean(e.get('nickname'), 100),
+            str(e.get('prize_code') or '')[:64],
+            _clean(e.get('label'), 100),
+            str(e.get('prize_type') or 'other')[:16],
+            int(e.get('credit') or 0),
+            str(e.get('source') or 'school')[:16],
+            str(e.get('status') or 'pending')[:16],
+            _clean(e.get('note'), 200),
+            str(e.get('dedup_key') or '')[:128],
+        )
+        for e in entries
+    ]
+    with _lock:
+        conn = connect()
+        before = conn.total_changes
+        conn.executemany(
+            'INSERT OR IGNORE INTO lottery_prizes('
+            'ts, uid, nickname, prize_code, label, prize_type, credit, source, '
+            'status, note, dedup_key) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            rows,
+        )
+        conn.commit()
+        return conn.total_changes - before
+
+
+def list_lottery_prizes(
+    limit: int = 200,
+    offset: int = 0,
+    *,
+    status: str | None = None,
+    prize_type: str | None = None,
+    uid: str | None = None,
+    days: int | None = None,
+) -> list[dict]:
+    where: list[str] = []
+    args: list[Any] = []
+    if status:
+        where.append('status = ?')
+        args.append(status)
+    if prize_type:
+        where.append('prize_type = ?')
+        args.append(prize_type)
+    if uid:
+        where.append('uid = ?')
+        args.append(uid)
+    d = clamp_days(days)
+    if d:
+        where.append('ts >= ?')
+        args.append(int(time.time()) - d * 86400)
+    clause = (' WHERE ' + ' AND '.join(where)) if where else ''
+    rows = query(
+        f'SELECT * FROM lottery_prizes{clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?',
+        (*args, min(2000, max(1, limit)), max(0, int(offset))),
+    )
+    return [dict(r) for r in rows]
+
+
+def count_lottery_prizes(
+    status: str | None = None,
+    prize_type: str | None = None,
+    uid: str | None = None,
+    days: int | None = None,
+) -> int:
+    where: list[str] = []
+    args: list[Any] = []
+    if status:
+        where.append('status = ?')
+        args.append(status)
+    if prize_type:
+        where.append('prize_type = ?')
+        args.append(prize_type)
+    if uid:
+        where.append('uid = ?')
+        args.append(uid)
+    d = clamp_days(days)
+    if d:
+        where.append('ts >= ?')
+        args.append(int(time.time()) - d * 86400)
+    clause = (' WHERE ' + ' AND '.join(where)) if where else ''
+    row = query_one(f'SELECT COUNT(*) AS n FROM lottery_prizes{clause}', args)
+    return int(row['n']) if row else 0
+
+
+def lottery_prize_stats(days: int | None = None) -> dict:
+    """按奖品类型 / 核销状态汇总，供页面顶部概览。
+
+    voucher_total / redeemed 是用户最关心的两个数（「中了多少张券、还剩几张
+    没核销」），单独给出，省得前端自己从 by_type 里挑。
+    """
+    where: list[str] = []
+    args: list[Any] = []
+    d = clamp_days(days)
+    if d:
+        where.append('ts >= ?')
+        args.append(int(time.time()) - d * 86400)
+    clause = (' WHERE ' + ' AND '.join(where)) if where else ''
+    rows = query(
+        f'SELECT prize_type, status, COUNT(*) AS n, COALESCE(SUM(credit),0) AS credit '
+        f'FROM lottery_prizes{clause} GROUP BY prize_type, status',
+        args,
+    )
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    total = 0
+    total_credit = 0
+    voucher_redeemed = 0
+    for r in rows:
+        n = int(r['n'])
+        t = str(r['prize_type'] or 'other')
+        s = str(r['status'] or 'pending')
+        by_type[t] = by_type.get(t, 0) + n
+        by_status[s] = by_status.get(s, 0) + n
+        total += n
+        total_credit += int(r['credit'] or 0)
+        if t == 'voucher' and s == 'redeemed':
+            voucher_redeemed += n
+    return {
+        'total': total,
+        'total_credit': total_credit,
+        'by_type': by_type,
+        'by_status': by_status,
+        'voucher_total': by_type.get('voucher', 0),
+        'voucher_redeemed': voucher_redeemed,
+    }
+
+
+def update_lottery_prize(prize_id: int, *, status: str | None = None,
+                         note: str | None = None) -> bool:
+    """更新一条中奖记录的状态 / 备注；返回是否命中了行。
+
+    只允许改这两个字段：奖品本体是脚本从腾讯回读的**事实**，不该被手工改写
+    （改了之后台账与腾讯对不上，反而更难查）。状态用于标记「已核销 / 作废」。
+    """
+    sets: list[str] = []
+    args: list[Any] = []
+    if status is not None:
+        if status not in _STATUS_VALUES:
+            raise ValueError('状态只能是 pending / redeemed / void')
+        sets.append('status = ?')
+        args.append(status)
+    if note is not None:
+        sets.append('note = ?')
+        args.append(_clean(note, 200))
+    if not sets:
+        return False
+    args.append(int(prize_id))
+    with _lock:
+        conn = connect()
+        cur = conn.execute(
+            f'UPDATE lottery_prizes SET {", ".join(sets)} WHERE id = ?', tuple(args))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def delete_lottery_prize(prize_id: int) -> bool:
+    with _lock:
+        conn = connect()
+        cur = conn.execute('DELETE FROM lottery_prizes WHERE id = ?', (int(prize_id),))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def clear_lottery_prizes() -> None:
+    execute('DELETE FROM lottery_prizes')
 
 
 # ── 用量回填 ─────────────────────────────────────────────

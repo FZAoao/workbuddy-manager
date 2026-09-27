@@ -51,11 +51,40 @@ from .. import config, db
 logger = logging.getLogger('workbuddy.taskrun')
 
 # 运行模式白名单（见模块注释的风险分级）。值 = 传给脚本的参数。
+#
+# 前三种调的是 `scripts/task_runner.py`（成长任务一体机）；后两种调的是
+# `scripts/school_open_day_2026.py`（开学季活动，含幸运大转盘抽奖）。
+# 之所以把开学季也收进来：它**不是**成长任务那套接口，但同样是「面板能触发、
+# 结果值得留痕」的任务，且它的抽奖中奖信息只打在脚本 stdout 里（容器日志
+# 看不到），只能由面板接住后落库（见 `_record_lottery`）。
 _MODE_ARGS: dict[str, list[str]] = {
     'preview': [],                       # 默认 dry-run，只读
     'claim': ['--yes', '--only-claim'],  # 幂等领奖
     'full': ['--yes'],                   # 点亮 + 领奖（会伪造上报）
+    # 开学季：--run 做任务 + 领奖 + 收尾抽奖（会发写请求）；--lottery-only 只抽奖
+    'school': ['--run', '--yes'],
+    'school-lottery': ['--lottery-only', '--yes'],
 }
+
+# 调 school 脚本的模式前缀（决定用哪个脚本文件）
+_SCHOOL_MODES = ('school', 'school-lottery')
+_SCHOOL_SCRIPT = 'school_open_day_2026.py'
+
+# 开学季转盘奖品：脚本打印的是**中文标签**（不是 prize_code），这里反查回码。
+# 与上游脚本 `LOTTERY_PRIZE_LABELS` 保持一致；脚本新增奖品时这里落不到就按
+# 未知奖品记录（label 原样保留），不编造 code。
+_LOTTERY_LABELS: dict[str, tuple[str, str]] = {
+    '瑞幸咖啡15元券': ('school_voucher_luckin', 'voucher'),
+    '肯德基OK餐券': ('school_voucher_kfc_ok', 'voucher'),
+    '肯德基冰淇淋券': ('school_voucher_kfc_ice', 'voucher'),
+    '酷狗会员月卡券': ('school_voucher_kugou', 'voucher'),
+}
+# 中奖行：`[school2026] <uid8> draw -> <label>（balance <n>）`
+_DRAW_LINE = re.compile(
+    r'\[school2026\]\s+(\S+)\s+draw\s+->\s+(.+?)（balance\s+\d+）')
+# 积分奖标签形如 `6积分（+6 Credit）`，从中取第一个整数
+_CREDIT_LABEL = re.compile(r'^(\d+)\s*积分')
+
 
 # 单次运行的**空闲**上限（秒）：多久没有新输出就判定卡死并终止。
 #
@@ -91,6 +120,10 @@ _state: dict = {
     'timed_out': False,
     'error': '',
     'lines': [],
+    # 本次运行从脚本 stdout 里抓到的中奖记录（见 `_capture_lottery`）。
+    # 单独存一份而不是事后从 lines 里捞：lines 只保留尾部 400 行，全量任务
+    # 的抽奖行可能已被挤掉，而中奖记录是要落库的事实，不能丢。
+    'prizes': [],
 }
 _task: asyncio.Task | None = None
 
@@ -103,6 +136,13 @@ def _host_script() -> Path | None:
     """
     from . import updater  # 复用既有的上游目录推断，避免两处口径不一
     p = updater._upstream_dir() / 'scripts' / 'task_runner.py'
+    return p if p.is_file() else None
+
+
+def _host_school_script() -> Path | None:
+    """宿主机挂载目录里的开学季脚本，没有则 None（与 `_host_script` 同口径）。"""
+    from . import updater
+    p = updater._upstream_dir() / 'scripts' / _SCHOOL_SCRIPT
     return p if p.is_file() else None
 
 
@@ -249,10 +289,26 @@ def _script_path() -> Path:
     注意不要为了「让第一条路径有东西」而让用户手动拷贝脚本：那样每次上游更新
     都要重来一次，迟早版本对不上（issue 里正是这么抱怨的）。
     """
-    host = _host_script()
+    return _locate_script(school=False)
+
+
+def _school_script_path() -> Path:
+    """定位 school_open_day_2026.py（开学季 + 幸运大转盘）。
+
+    与 `_script_path` 同一套定位逻辑（宿主机挂载优先 → 容器提取回落），只是
+    文件名不同。单独一个函数而不是给 `_script_path` 加参数，是为了让既有调用
+    点与测试替身（mock 的 0 参 lambda）逐字不变。
+    """
+    return _locate_script(school=True)
+
+
+def _locate_script(*, school: bool) -> Path:
+    name = _SCHOOL_SCRIPT if school else 'task_runner.py'
+    host = _host_school_script() if school else _host_script()
     if host is not None:
         return host
-    extracted = _extract_dir() / 'task_runner.py'
+    extracted = _extract_dir() / name
+    # `_cache_is_fresh()` 以整组脚本的镜像指纹为准，两种脚本共用同一份提取产物
     if extracted.is_file() and _cache_is_fresh():
         return extracted
     ok, _ = extract_scripts()
@@ -267,7 +323,7 @@ def _python() -> str:
     return sys.executable or 'python3'
 
 
-def available() -> tuple[bool, str]:
+def available(school: bool = False) -> tuple[bool, str]:
     """能否执行（上游目录与脚本是否到位）。返回 (可用, 说明)。
 
     单独抽出来是为了让接口能在**动手前**就拒绝，并把原因说清楚 ——
@@ -276,11 +332,12 @@ def available() -> tuple[bool, str]:
     **这是阻塞调用**（可能 fork `docker inspect` / `docker cp`）。在事件循环里
     调用请改用 `available_async()`，否则一次 docker 卡顿会冻住整个服务。
     """
-    script = _script_path()
+    script = _school_script_path() if school else _script_path()
     if not script.is_file():
+        which = _SCHOOL_SCRIPT if school else 'task_runner.py'
         return False, (
             f'未找到上游任务脚本（{script}）。'
-            '该功能调用的是上游 workbuddy2api 自带的 scripts/task_runner.py。\n'
+            f'该功能调用的是上游 workbuddy2api 自带的 scripts/{which}。\n'
             '两种部署形态各有一种修法：\n'
             '  · 官方镜像部署：本面板会尝试用 `docker cp` 从上游容器里提取脚本，'
             '但它需要能访问 docker（挂载 /var/run/docker.sock，且容器名与 '
@@ -317,7 +374,11 @@ def status() -> dict:
     """
     snap = dict(_state)
     snap['lines'] = list(_state['lines'])
+    snap['prizes'] = list(_state['prizes'])
     snap['available'], snap['unavailable_reason'] = available()
+    # 开学季走的是另一个脚本，可用性单独探测（它可能因上游版本较旧而不存在，
+    # 与成长任务脚本的可用性互不影响）。
+    snap['school_available'], snap['school_unavailable_reason'] = available(school=True)
     snaps = db.get_setting('task_claim_schedule') or {}
     snap['schedule'] = snaps if isinstance(snaps, dict) else {}
     return snap
@@ -333,7 +394,8 @@ def build_command(mode: str, target: str) -> list[str]:
     # 脚本每行约 80 字节，于是一次全量要跑满约 100 行才会吐出第一批输出——
     # 用户看到的就是「点了做任务，卡半天没有任何输出，然后突然冒出一大段」
     # （线上实测）。加 -u 后每行实时可见，面板才真的能当进度看。
-    return [_python(), '-u', str(_script_path()), target, *_MODE_ARGS[mode]]
+    script = _school_script_path() if mode in _SCHOOL_MODES else _script_path()
+    return [_python(), '-u', str(script), target, *_MODE_ARGS[mode]]
 
 
 def _prepare(mode: str, target: str) -> tuple[bool, object]:
@@ -350,7 +412,7 @@ def _prepare(mode: str, target: str) -> tuple[bool, object]:
     → 线程池的工作线程没有运行中的事件循环，`get_running_loop()` 必然抛
     RuntimeError，于是「一键执行」100% 报「当前环境没有事件循环，无法后台执行」。
     """
-    ok, why = available()
+    ok, why = available(mode in _SCHOOL_MODES)
     if not ok:
         return False, why
     if _state['running']:
@@ -369,6 +431,7 @@ def _launch(argv: list[str], mode: str, target: str, loop) -> tuple[bool, str]:
         'running': True, 'mode': mode, 'target': target,
         'started_at': int(time.time()), 'finished_at': 0,
         'exit_code': None, 'timed_out': False, 'error': '', 'lines': [],
+        'prizes': [],
     })
     _task = loop.create_task(_run(argv, mode, target))
     return True, f'已开始执行（{mode}）'
@@ -415,7 +478,8 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
     # 上游目录作为 cwd：脚本以 __file__ 自定位，但仍按上游惯例从仓库根运行。
     # 丢进线程池：`_script_path()` 在脚本缺失时会触发 docker 提取（阻塞），
     # 而本函数跑在事件循环里。
-    script_path = await asyncio.to_thread(_script_path)
+    script_path = await asyncio.to_thread(
+        _school_script_path if mode in _SCHOOL_MODES else _script_path)
     cwd = str(script_path.parent.parent)
 
     proc = None
@@ -448,6 +512,9 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
                 line = raw.decode('utf-8', errors='replace').rstrip('\r\n')
                 if line:
                     _append(line)
+                    # 开学季抽奖的中奖行只出现在脚本 stdout 里（容器日志看不到），
+                    # 边读边抓，落库时才不会因 lines 只留尾部而丢记录。
+                    _capture_lottery(line)
                     last_seen = time.time()
 
         try:
@@ -478,6 +545,7 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
                 pass
         _state['running'] = False
         _state['finished_at'] = int(time.time())
+        _record_lottery(mode, target)
         _record_history(mode, target)
 
 
@@ -493,16 +561,98 @@ def _append(line: str) -> None:
         del lines[:len(lines) - _MAX_LOG_LINES]
 
 
+def _capture_lottery(line: str) -> None:
+    """从一行脚本输出里抓出中奖记录，追加到 `_state['prizes']`。
+
+    脚本的中奖行形如：
+
+        [school2026] 2fb53fe4 draw -> 瑞幸咖啡15元券（balance 0）
+        [school2026] 2fb53fe4 draw -> 6积分（+6 Credit）（balance 3）
+
+    只认 `draw -> <label>（balance <n>）` 这一种形态：它是**真正中奖**的行；
+    脚本里「无一抽出奖」「未中奖，停」等行不匹配，不会被误记成中奖。
+    """
+    m = _DRAW_LINE.search(line or '')
+    if not m:
+        return
+    uid8 = m.group(1).strip()
+    label = m.group(2).strip()
+    credit = 0
+    m_credit = _CREDIT_LABEL.match(label)
+    if m_credit:
+        prize_type = 'credit'
+        credit = int(m_credit.group(1))
+        code = ''          # 积分奖没有 voucher code；label 本身已说明数量
+    else:
+        hit = _LOTTERY_LABELS.get(label)
+        if hit:
+            code, prize_type = hit
+        else:
+            # 未知奖码：如实记录 label，不编造 code（与脚本 lottery_prize_text 同口径）
+            code, prize_type = '', 'other'
+    _state['prizes'].append({
+        'uid': uid8,
+        'label': label,
+        'prize_code': code,
+        'prize_type': prize_type,
+        'credit': credit,
+    })
+
+
+def _record_lottery(mode: str, target: str) -> None:
+    """把本次运行抓到的中奖记录落库（幂等：dedup_key 重复的忽略）。
+
+    只在开学季模式（school / school-lottery）下写——其它模式脚本不抽奖，
+    `_state['prizes']` 必为空，写也是白写。
+
+    dedup_key = `school:<结束时间戳>:<账号>:<奖码或标签>:<该账号第几抽>`：
+    同一次运行重复解析（前端轮询状态多次读到同一份 prizes）不会重复入库；
+    而不同轮次的同一奖码会各自留痕（那是真的又中了一次）。
+    """
+    if mode not in _SCHOOL_MODES or not _state['prizes']:
+        return
+    finished = _state['finished_at'] or int(time.time())
+    counts: dict[str, int] = {}
+    entries: list[dict] = []
+    for p in _state['prizes']:
+        uid = str(p.get('uid') or '')
+        key_id = p.get('prize_code') or p.get('label') or '?'
+        counts[key_id] = counts.get(key_id, 0) + 1
+        entries.append({
+            'ts': finished,
+            'uid': uid,
+            'nickname': '',   # 昵称由前端/接口按 uid 解析（与 task_logs 同口径）
+            'prize_code': p.get('prize_code') or '',
+            'label': p.get('label') or '',
+            'prize_type': p.get('prize_type') or 'other',
+            'credit': int(p.get('credit') or 0),
+            'source': 'school',
+            'status': 'pending',
+            'dedup_key': f'school:{finished}:{uid}:{key_id}:{counts[key_id]}',
+        })
+    try:
+        added = db.add_lottery_prizes(entries)
+        if added:
+            logger.info('开学季抽奖记录已入库 %d 条', added)
+    except Exception as exc:  # noqa: BLE001
+        # 落库失败不能影响脚本本身的执行结果（用户已跑完任务，记录丢了可重跑）
+        logger.warning('写入抽奖记录失败（不影响执行）: %s', exc)
+
+
 def _record_history(mode: str, target: str) -> None:
     """把这次执行的结果写进「任务记录」，让它在历史里能查到。
 
-    只在**真正可能产生写入**的模式下记录（claim / full），且只记一行结果 ——
-    逐行上报日志交给采集器读容器日志，这里记的是「面板发起的这次操作」。
+    只在**真正可能产生写入**的模式下记录（claim / full / school /
+    school-lottery），且只记一行结果 —— 逐行上报日志交给采集器读容器日志，
+    这里记的是「面板发起的这次操作」。
     """
-    if mode not in ('claim', 'full'):
+    if mode not in ('claim', 'full', 'school', 'school-lottery'):
         return
     summary = _summarize()
-    label = {'claim': '一键领奖', 'full': '一键做任务'}[mode]
+    label = {
+        'claim': '一键领奖', 'full': '一键做任务',
+        'school': '开学季任务', 'school-lottery': '开学季抽奖',
+    }[mode]
     level = 'ok'
     if _state['error'] or _state['timed_out'] or (_state['exit_code'] not in (0, None)):
         level = 'fail'
@@ -525,7 +675,8 @@ def _summarize() -> str:
     """从脚本输出里挑出**结果汇总**行。
 
     注意别抓错行：脚本开头会打一行 `mode=DRY-RUN accounts=[...]`，那只是**运行
-    参数**（不是结果）；真正的结果在结尾的 `task_runner done: accounts=1 ok=3 …`。
+    参数**（不是结果）；真正的结果在结尾的 `task_runner done: accounts=1 ok=3 …`
+    （开学季脚本则是 `school2026 done: accounts=… ok=…`）。
     早先按 `mode=` 匹配，抓到的是参数行 —— 记录进历史的「结果」就变成了
     「mode=DRY-RUN …」，等于没记结果（实测发现）。
     """

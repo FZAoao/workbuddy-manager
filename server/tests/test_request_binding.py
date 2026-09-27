@@ -173,6 +173,9 @@ class PostParamLocationAuditTest(unittest.TestCase):
         '/api/accounts/{filename}/disabled': {'upstream_id'},
         '/api/accounts/{filename}/move': {'upstream_id'},
         '/api/restart': {'upstream_id'},
+        # 在线导入（multipart 上传 auth JSON）：upstream_id 用 query 指定目标
+        # 分组（与其它账号写端点一致；文件走 multipart，不能再塞进 body）。
+        '/api/accounts/import': {'upstream_id'},
     }
 
     # 覆盖的方法：**所有带 body 的写方法**，不只是 POST。

@@ -16,6 +16,7 @@ import {
   Settings,
   PlusCircle,
   User,
+  Ticket,
   LogOut as LogOutIcon,
   ShieldAlert as ShieldAlertIcon,
   Link2,
@@ -448,6 +449,12 @@ export function ManagementBar() {
       title: t('nav.tasks'),
       icon: <ClipboardList {...IconOptions} />,
       href: '/tasks',
+    },
+    {
+      // 中奖记录紧挨着任务：它们是开学季任务/抽奖跑出来的产物
+      title: t('nav.prizes'),
+      icon: <Ticket {...IconOptions} />,
+      href: '/prizes',
     },
     {
       title: t('nav.keys'),

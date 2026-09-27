@@ -21,10 +21,13 @@ import type {
   CreatedApiToken,
   IpAccessLog,
   IpRule,
+  ImportResponse,
   KeyExportResult,
   KeyImportDetectResult,
   KeyImportResult,
   KeyImportStatus,
+  LotteryPrizeResponse,
+  LotteryPrizeStatus,
   Me,
   AuditLogPage,
   ModelCatalog,
@@ -275,12 +278,44 @@ export const accountApi = {
    * 调用上游自带的 scripts/task_runner.py。full（点亮）会伪造活跃上报，
    * 因此单独要求 confirm，与幂等的 claim 区分开。 */
   taskRunStatus: () => get<TaskRunStatus>('/api/task-run'),
-  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false) =>
-    post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
+  taskRunStart: (
+    mode: 'preview' | 'claim' | 'full' | 'school' | 'school-lottery',
+    target = 'ALL',
+    confirm = false,
+  ) => post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
   taskRunStop: () => post<{ok: boolean; message: string}>('/api/task-run/stop'),
   taskClaimSchedule: () => get<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule'),
   saveTaskClaimSchedule: (enabled: boolean, hours: number[]) =>
     put<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule', {enabled, hours}),
+
+  /**
+   * **在线导入**账号授权 JSON（拖拽 / 选择文件）。一次可传多个文件，每个
+   * 独立处理，逐个返回成功 / 失败原因（一个坏文件不会中断整批）。
+   *
+   * 与扫码添加并列的第二种加号方式：把从别处拿到的 auth JSON 直接拖进来。
+   * upstreamId 非空时导入该分组的账号目录。
+   */
+  importAccounts: (files: File[], upstreamId?: number | null) => {
+    const form = new FormData();
+    for (const f of files) form.append('files', f, f.name);
+    // **不要手动设 Content-Type**：浏览器需要自己带上 multipart 的 boundary，
+    // 手动写死 `multipart/form-data`（无 boundary）会让后端解析不出文件。
+    return http
+      .post<ImportResponse>(`/api/accounts/import${groupQs(upstreamId)}`, form)
+      .then((r) => r.data);
+  },
+
+  /* ── 开学季抽奖中奖记录 ──────────────────────────────
+   * 中奖信息只打在开学季脚本 stdout 里（容器日志看不到），由面板触发脚本时
+   * 抓取落库。列表只读、任何已登录用户可看；改状态要 admin，删除要会话管理员。 */
+  lotteryPrizes: (params: {
+    limit?: number; offset?: number; status?: string;
+    prize_type?: string; uid?: string; days?: number;
+  } = {}) => get<LotteryPrizeResponse>('/api/lottery-prizes', params),
+  updateLotteryPrize: (id: number, body: {status?: LotteryPrizeStatus; note?: string}) =>
+    patch<{ok: boolean}>(`/api/lottery-prizes/${id}`, body),
+  removeLotteryPrize: (id: number) => del<{ok: boolean}>(`/api/lottery-prizes/${id}`),
+  clearLotteryPrizes: () => post<{ok: boolean}>('/api/lottery-prizes/clear'),
 };
 
 /* ── 上游状态 ───────────────────────────────────────── */

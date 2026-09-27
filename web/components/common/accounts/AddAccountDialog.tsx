@@ -4,7 +4,16 @@ import {useCallback, useEffect, useRef, useState} from 'react';
 import {QRCodeSVG} from 'qrcode.react';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
-import {Loader2, CheckCircle2, AlertTriangle, ExternalLink} from 'lucide-react';
+import {
+  Loader2,
+  CheckCircle2,
+  AlertTriangle,
+  ExternalLink,
+  UploadCloud,
+  ScanLine,
+  FileJson,
+  X,
+} from 'lucide-react';
 import {
   Select,
   SelectContent,
@@ -16,6 +25,7 @@ import {accountApi, errText} from '@/lib/api';
 import {useRealm} from '@/lib/realm-context';
 import {Button} from '@/components/ui/button';
 import {CopyButton, ShareButton} from '@/components/ui/copy-button';
+import type {ImportResult} from '@/lib/types';
 import {
   Dialog,
   DialogContent,
@@ -25,6 +35,8 @@ import {
 } from '@/components/animate-ui/radix/dialog';
 
 type Phase = 'loading' | 'waiting' | 'success' | 'error';
+/** 弹窗的两种添加方式：扫码登录 / 在线导入 auth JSON */
+type Mode = 'scan' | 'import';
 
 /**
  * 连续失败几次才打断轮询。
@@ -49,6 +61,10 @@ const INTERNATIONAL_REGIONS = [
   {code: 'MY', key: 'region.MY'},
   {code: 'ID', key: 'region.ID'},
 ] as const;
+
+/** 在线导入：单文件上限（与后端 _IMPORT_MAX_BYTES 一致），前端先拦一次。 */
+const IMPORT_MAX_BYTES = 512 * 1024;
+const IMPORT_ACCEPT = '.json,application/json';
 
 /**
  * 「用户回到这个页面了」的信号源列表。
@@ -86,6 +102,7 @@ export function AddAccountDialog({
   upstreamId?: number | null;
 }) {
   const t = useT();
+  const [mode, setMode] = useState<Mode>('scan');
   const [phase, setPhase] = useState<Phase>('loading');
   /** 版本跟随全站切换：切到国际版时扫码走国际版端点，并需要选地区 */
   const {realm, label: realmName} = useRealm();
@@ -106,6 +123,13 @@ export function AddAccountDialog({
    * 同生共死，避免「切回来时调用了一个已被 stopPoll 作废的闭包」。
    */
   const tickRef = useRef<(() => void) | null>(null);
+
+  /* ── 在线导入（拖拽 / 选择 auth JSON）────────────────────── */
+  const [files, setFiles] = useState<File[]>([]);
+  const [importing, setImporting] = useState(false);
+  const [results, setResults] = useState<ImportResult[] | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const stopPoll = useCallback(() => {
     if (timerRef.current !== null) {
@@ -225,7 +249,8 @@ export function AddAccountDialog({
   }, [onOpenChange, onSuccess, stopPoll, realm, region, t, upstreamId]);
 
   useEffect(() => {
-    if (open) {
+    // 导入模式不申请二维码：只有扫码模式才轮询。
+    if (open && mode === 'scan') {
       start();
     } else {
       stopPoll();
@@ -233,113 +258,314 @@ export function AddAccountDialog({
     return stopPoll;
     // 版本或地区变化时重新申请：扫码码是绑定端点的，旧码不能跨版本用
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, realm, region]);
+  }, [open, mode, realm, region]);
+
+  // 关闭弹窗时清空导入状态，下次打开是干净的
+  useEffect(() => {
+    if (!open) {
+      setFiles([]);
+      setResults(null);
+      setImporting(false);
+      setDragOver(false);
+      setMode('scan');
+    }
+  }, [open]);
+
+  const addFiles = useCallback((picked: FileList | File[]) => {
+    const incoming = Array.from(picked).filter((f) => f.name.toLowerCase().endsWith('.json'));
+    if (!incoming.length) {
+      notify.warn(t('addAccount.importNoJson'));
+      return;
+    }
+    // 同名去重（拖两次同一批很常见），并限制单文件大小
+    setFiles((prev) => {
+      const names = new Set(prev.map((f) => f.name));
+      const merged = [...prev];
+      for (const f of incoming) {
+        if (names.has(f.name)) continue;
+        names.add(f.name);
+        merged.push(f);
+      }
+      return merged;
+    });
+    setResults(null);
+  }, [t]);
+
+  const doImport = useCallback(async () => {
+    const tooBig = files.filter((f) => f.size > IMPORT_MAX_BYTES);
+    if (tooBig.length) {
+      notify.err(t('addAccount.importTooBig',
+                   {max: Math.floor(IMPORT_MAX_BYTES / 1024)}));
+      return;
+    }
+    setImporting(true);
+    try {
+      const res = await accountApi.importAccounts(files, upstreamId);
+      setResults(res.results);
+      if (res.succeeded > 0) {
+        notify.ok(
+          t('addAccount.importDone', {ok: res.succeeded, n: res.succeeded}),
+          res.failed > 0 ? t('addAccount.importDonePartial', {fail: res.failed}) : undefined,
+        );
+        window.dispatchEvent(new Event('workbuddy-manager:accounts-changed'));
+        onSuccess?.();
+      } else {
+        notify.err(t('addAccount.importAllFailed'));
+      }
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setImporting(false);
+    }
+  }, [files, upstreamId, onSuccess, t]);
+
+  const importFailed = (results ?? []).filter((r) => !r.ok).length;
+  const importOk = (results ?? []).filter((r) => r.ok).length;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[420px]" showCloseButton>
+      <DialogContent className="max-w-[460px]" showCloseButton>
         <DialogHeader>
           <DialogTitle>{t('addAccount.title', {realm: realmName})}</DialogTitle>
           <DialogDescription>
-            {realm === 'global'
-              ? t('addAccount.descGlobal')
-              : t('addAccount.descCn')}
+            {mode === 'import'
+              ? t('addAccount.importDesc')
+              : realm === 'global'
+                ? t('addAccount.descGlobal')
+                : t('addAccount.descCn')}
           </DialogDescription>
         </DialogHeader>
 
+        {/* 两种添加方式：扫码登录 / 在线导入 auth JSON */}
+        <div className="mx-6 flex gap-1 rounded-full bg-muted p-1">
+          {([
+            ['scan', t('addAccount.tabScan'), ScanLine],
+            ['import', t('addAccount.tabImport'), UploadCloud],
+          ] as const).map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setMode(id)}
+              className={
+                'flex flex-1 items-center justify-center gap-1.5 rounded-full px-3 py-1.5 text-xs transition-colors ' +
+                (mode === id
+                  ? 'bg-background font-medium text-foreground shadow-sm'
+                  : 'text-muted-foreground')
+              }
+            >
+              <Icon className="h-3.5 w-3.5" />
+              {label}
+            </button>
+          ))}
+        </div>
+
         <div className="flex w-full min-w-0 flex-col items-center gap-4 px-6 pb-6">
-          {/* 国际版必须先完成地区注册，否则聊天报 14017。
-              放在二维码之前：地区一变就要重新申请授权码，先选好再扫省得白扫。 */}
-          {realm === 'global' && (
-            <div className="w-full space-y-1.5">
-              <div className="text-[11px] font-medium">{t('addAccount.regionLabel')}</div>
-              <Select value={region} onValueChange={setRegion}>
-                <SelectTrigger className="h-9 w-full rounded-full text-xs">
-                  <SelectValue placeholder={t('addAccount.regionPlaceholder')} />
-                </SelectTrigger>
-                <SelectContent>
-                  {INTERNATIONAL_REGIONS.map((r) => (
-                    <SelectItem key={r.code} value={r.code} className="text-xs">
-                      {t('addAccount.regionOption', {label: t(r.key), code: r.code})}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {!region && (
-                <p className="text-[10px] leading-4 text-muted-foreground">
-                  {t('addAccount.regionHint')}
-                </p>
+          {mode === 'scan' ? (
+            <>
+              {/* 国际版必须先完成地区注册，否则聊天报 14017。
+                  放在二维码之前：地区一变就要重新申请授权码，先选好再扫省得白扫。 */}
+              {realm === 'global' && (
+                <div className="w-full space-y-1.5">
+                  <div className="text-[11px] font-medium">{t('addAccount.regionLabel')}</div>
+                  <Select value={region} onValueChange={setRegion}>
+                    <SelectTrigger className="h-9 w-full rounded-full text-xs">
+                      <SelectValue placeholder={t('addAccount.regionPlaceholder')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {INTERNATIONAL_REGIONS.map((r) => (
+                        <SelectItem key={r.code} value={r.code} className="text-xs">
+                          {t('addAccount.regionOption', {label: t(r.key), code: r.code})}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {!region && (
+                    <p className="text-[10px] leading-4 text-muted-foreground">
+                      {t('addAccount.regionHint')}
+                    </p>
+                  )}
+                </div>
               )}
-            </div>
-          )}
 
-          {/* 固定尺寸，避免 loading/waiting/error 各阶段弹窗高度跳动 */}
-          <div className="grid h-[212px] w-[212px] shrink-0 place-items-center overflow-hidden rounded-2xl bg-white p-3 ring-1 ring-black/5">
-            {phase === 'loading' && <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />}
-            {phase === 'error' && <AlertTriangle className="h-7 w-7 text-amber-500" />}
-            {(phase === 'waiting' || phase === 'success') && authUrl && (
-              <QRCodeSVG value={authUrl} size={188} level="M" />
-            )}
-          </div>
-
-          {authUrl && (
-            <div className="w-full space-y-2">
-              {/* 链接本身可点开；旁边给复制与分享，便于把授权链接发给朋友 */}
-              <div className="flex w-full items-center gap-1.5 rounded-full bg-muted px-3 py-1.5">
-                <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
-                <a
-                  href={authUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  title={authUrl}
-                  className="min-w-0 flex-1 truncate text-[11px] text-blue-500 hover:underline"
-                >
-                  {authUrl}
-                </a>
+              {/* 固定尺寸，避免 loading/waiting/error 各阶段弹窗高度跳动 */}
+              <div className="grid h-[212px] w-[212px] shrink-0 place-items-center overflow-hidden rounded-2xl bg-white p-3 ring-1 ring-black/5">
+                {phase === 'loading' && <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />}
+                {phase === 'error' && <AlertTriangle className="h-7 w-7 text-amber-500" />}
+                {(phase === 'waiting' || phase === 'success') && authUrl && (
+                  <QRCodeSVG value={authUrl} size={188} level="M" />
+                )}
               </div>
-              <div className="flex flex-wrap items-center justify-center gap-2">
-                <CopyButton
-                  value={authUrl}
-                  size="sm"
-                  showLabel
-                  label={t('addAccount.copyLink')}
-                  variant="outline"
-                  className="rounded-full"
-                />
-                <ShareButton
-                  title={t('addAccount.shareTitle')}
-                  text={t('addAccount.shareText')}
-                  url={authUrl}
+
+              {authUrl && (
+                <div className="w-full space-y-2">
+                  {/* 链接本身可点开；旁边给复制与分享，便于把授权链接发给朋友 */}
+                  <div className="flex w-full items-center gap-1.5 rounded-full bg-muted px-3 py-1.5">
+                    <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+                    <a
+                      href={authUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={authUrl}
+                      className="min-w-0 flex-1 truncate text-[11px] text-blue-500 hover:underline"
+                    >
+                      {authUrl}
+                    </a>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <CopyButton
+                      value={authUrl}
+                      size="sm"
+                      showLabel
+                      label={t('addAccount.copyLink')}
+                      variant="outline"
+                      className="rounded-full"
+                    />
+                    <ShareButton
+                      title={t('addAccount.shareTitle')}
+                      text={t('addAccount.shareText')}
+                      url={authUrl}
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div
+                className={
+                  'flex items-center gap-2 px-2 text-xs ' +
+                  (phase === 'success' ?
+                    'text-emerald-500' :
+                    phase === 'error' ?
+                      'text-red-500' :
+                      'text-muted-foreground')
+                }
+              >
+                {phase === 'waiting' && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />}
+                {phase === 'success' && <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />}
+                <span className="text-center">{message}</span>
+              </div>
+
+              <div className="flex w-full gap-2">
+                <Button variant="outline" className="flex-1 rounded-full" onClick={() => onOpenChange(false)}>
+                  {t('common.cancel')}
+                </Button>
+                {phase === 'error' && (
+                  <Button className="flex-1 rounded-full" onClick={start}>
+                    {t('addAccount.retry')}
+                  </Button>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              {/* 拖拽区 / 点选文件 */}
+              <div
+                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDragOver(false);
+                  if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+                }}
+                onClick={() => fileInputRef.current?.click()}
+                className={
+                  'flex w-full cursor-pointer flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed px-4 py-8 text-center transition-colors ' +
+                  (dragOver
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border bg-muted/40 hover:border-muted-foreground/40')
+                }
+              >
+                <UploadCloud className="h-7 w-7 text-muted-foreground" />
+                <div className="text-xs font-medium">{t('addAccount.importDropHint')}</div>
+                <div className="text-[10px] leading-4 text-muted-foreground">
+                  {t('addAccount.importDropSub')}
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={IMPORT_ACCEPT}
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    if (e.target.files?.length) addFiles(e.target.files);
+                    e.target.value = '';   // 允许重复选同一个文件
+                  }}
                 />
               </div>
-            </div>
+
+              {/* 已选文件列表 */}
+              {files.length > 0 && (
+                <div className="w-full space-y-1">
+                  {files.map((f) => {
+                    const r = results?.find((x) => x.file === f.name);
+                    return (
+                      <div key={f.name}
+                           className="flex items-center gap-2 rounded-xl bg-muted px-3 py-1.5">
+                        <FileJson className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 flex-1 truncate text-[11px]" title={f.name}>
+                          {f.name}
+                        </span>
+                        {r && (
+                          r.ok ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+                          ) : (
+                            <span className="shrink-0 text-[10px] text-red-500"
+                                  title={r.error}>
+                              {t('addAccount.importItemFailed')}
+                            </span>
+                          )
+                        )}
+                        {!importing && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFiles((prev) => prev.filter((x) => x.name !== f.name));
+                              setResults(null);
+                            }}
+                            className="shrink-0 text-muted-foreground hover:text-foreground"
+                            aria-label={t('common.clear')}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* 失败原因（逐个列出，便于用户修文件后重试） */}
+              {results && importFailed > 0 && (
+                <div className="w-full space-y-1 rounded-xl bg-red-500/5 px-3 py-2">
+                  {results.filter((r) => !r.ok).map((r) => (
+                    <div key={r.file} className="text-[10px] leading-4 text-red-600 dark:text-red-400">
+                      <span className="font-medium">{r.file}</span>：{r.error}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {results && importOk > 0 && (
+                <div className="flex w-full items-center justify-center gap-1.5 text-xs text-emerald-500">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  {t('addAccount.importSuccessNote', {ok: importOk, n: importOk})}
+                </div>
+              )}
+
+              <div className="flex w-full gap-2">
+                <Button variant="outline" className="flex-1 rounded-full"
+                        onClick={() => onOpenChange(false)}>
+                  {t('common.close')}
+                </Button>
+                <Button className="flex-1 rounded-full"
+                        disabled={importing || files.length === 0}
+                        onClick={doImport}>
+                  {importing
+                    ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />{t('addAccount.importing')}</>
+                    : t('addAccount.importButton', {n: files.length})}
+                </Button>
+              </div>
+            </>
           )}
-
-          <div
-            className={
-              'flex items-center gap-2 px-2 text-xs ' +
-              (phase === 'success' ?
-                'text-emerald-500' :
-                phase === 'error' ?
-                  'text-red-500' :
-                  'text-muted-foreground')
-            }
-          >
-            {phase === 'waiting' && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />}
-            {phase === 'success' && <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />}
-            <span className="text-center">{message}</span>
-          </div>
-
-          <div className="flex w-full gap-2">
-            <Button variant="outline" className="flex-1 rounded-full" onClick={() => onOpenChange(false)}>
-              {t('common.cancel')}
-            </Button>
-            {phase === 'error' && (
-              <Button className="flex-1 rounded-full" onClick={start}>
-                {t('addAccount.retry')}
-              </Button>
-            )}
-          </div>
         </div>
       </DialogContent>
     </Dialog>

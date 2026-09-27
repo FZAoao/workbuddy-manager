@@ -2,3 +2,6 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 httpx>=0.27.0
 pydantic>=2.7.0
+# 在线导入账号（POST /api/accounts/import）用 multipart 上传：FastAPI 的
+# File()/UploadFile 依赖它解析表单，缺失时该端点会直接报 500。
+python-multipart>=0.0.9

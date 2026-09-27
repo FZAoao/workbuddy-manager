@@ -1,7 +1,7 @@
 'use client';
 
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {Play, Square, Eye, Gift, Sparkles, Loader2, TriangleAlert} from 'lucide-react';
+import {Play, Square, Eye, Gift, Sparkles, Loader2, TriangleAlert, GraduationCap} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {
@@ -35,6 +35,8 @@ export function TaskRunnerPanel() {
   const {t, tp} = useI18n();
   const [status, setStatus] = useState<TaskRunStatus | null>(null);
   const [confirmFull, setConfirmFull] = useState(false);
+  /** 开学季二次确认：'school'（做任务）或 'school-lottery'（只抽奖） */
+  const [confirmSchool, setConfirmSchool] = useState<'school' | 'school-lottery' | null>(null);
   const [busy, setBusy] = useState(false);
   // 轮询定时器：跑的时候高频、闲着的时候不轮询（省请求）
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -64,7 +66,8 @@ export function TaskRunnerPanel() {
     };
   }, [load]);
 
-  async function run(mode: 'preview' | 'claim' | 'full', confirm = false) {
+  async function run(mode: 'preview' | 'claim' | 'full' | 'school' | 'school-lottery',
+                     confirm = false) {
     setBusy(true);
     try {
       await accountApi.taskRunStart(mode, 'ALL', confirm);
@@ -94,6 +97,8 @@ export function TaskRunnerPanel() {
 
   const running = status?.running === true;
   const unavailable = status && !status.available;
+  /** 开学季脚本可能单独缺失（上游版本较旧），与成长任务脚本独立判断 */
+  const schoolUnavailable = status && status.school_available === false;
 
   return (
     <section className="rounded-2xl border bg-card p-4">
@@ -133,6 +138,24 @@ export function TaskRunnerPanel() {
             <Play className="mr-1.5 size-3.5" />
             {t('tasks.runFull')}
           </Button>
+          {/* 开学季：做任务 + 领奖 + 抽奖（写请求，走二次确认） */}
+          <Button variant="ghost" size="sm"
+                  className="h-8 rounded-full text-amber-600 hover:text-amber-600 dark:text-amber-400"
+                  disabled={busy || running || !!schoolUnavailable}
+                  title={t('tasks.runSchoolHint')}
+                  onClick={() => setConfirmSchool('school')}>
+            <GraduationCap className="mr-1.5 size-3.5" />
+            {t('tasks.runSchool')}
+          </Button>
+          {/* 开学季只抽奖：消耗抽奖次数（不可逆），也走二次确认 */}
+          <Button variant="ghost" size="sm"
+                  className="h-8 rounded-full"
+                  disabled={busy || running || !!schoolUnavailable}
+                  title={t('tasks.runSchoolLotteryHint')}
+                  onClick={() => setConfirmSchool('school-lottery')}>
+            <Gift className="mr-1.5 size-3.5" />
+            {t('tasks.runSchoolLottery')}
+          </Button>
           {running && (
             <Button variant="ghost" size="sm"
                     className="h-8 rounded-full text-red-500"
@@ -153,6 +176,15 @@ export function TaskRunnerPanel() {
               这个最有用的信息淹掉。 */}
           <span className="text-[11px] leading-relaxed whitespace-pre-line text-muted-foreground">
             {status?.unavailable_reason}
+          </span>
+        </div>
+      )}
+      {/* 开学季脚本单独缺失时也说明原因（成长任务照常可用） */}
+      {schoolUnavailable && (
+        <div className="mb-3 flex items-start gap-2 rounded-xl bg-muted px-3 py-2">
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+          <span className="text-[11px] leading-relaxed whitespace-pre-line text-muted-foreground">
+            {status?.school_unavailable_reason}
           </span>
         </div>
       )}
@@ -198,6 +230,41 @@ export function TaskRunnerPanel() {
                       await run('full', true);
                     }}>
               {t('tasks.runFullConfirmOk')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* 开学季二次确认：做任务 / 只抽奖，两种模式各有各的后果 */}
+      <Dialog open={confirmSchool !== null}
+              onOpenChange={(v) => { if (!v) setConfirmSchool(null); }}>
+        <DialogContent className="max-w-[460px]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <TriangleAlert className="size-4 text-amber-500" />
+              {confirmSchool === 'school-lottery'
+                ? t('tasks.runSchoolLotteryConfirmTitle')
+                : t('tasks.runSchoolConfirmTitle')}
+            </DialogTitle>
+            <DialogDescription className="pt-2 text-[13px] leading-relaxed">
+              <RichText text={confirmSchool === 'school-lottery'
+                ? t('tasks.runSchoolLotteryConfirmBody')
+                : t('tasks.runSchoolConfirmBody')} />
+            </DialogDescription>
+          </DialogHeader>
+          <div className="mt-2 flex justify-end gap-2">
+            <Button variant="ghost" size="sm" className="rounded-full"
+                    onClick={() => setConfirmSchool(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button size="sm" className="rounded-full"
+                    disabled={busy}
+                    onClick={async () => {
+                      const mode = confirmSchool;
+                      setConfirmSchool(null);
+                      if (mode) await run(mode, true);
+                    }}>
+              {t('tasks.runSchoolConfirmOk')}
             </Button>
           </div>
         </DialogContent>
