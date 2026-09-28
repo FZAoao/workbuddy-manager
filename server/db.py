@@ -378,6 +378,33 @@ CREATE TABLE IF NOT EXISTS upstreams (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- 账号补货页：管理员生成的独立导入页，凭链接里的 token 导入账号
+-- （见 server/restocksvc.py 与 web/app/restock）。
+--
+-- token 存**明文**：与红包的抽奖码 / red_packet_shares.token 同一个取舍 ——
+-- 链接要能随时回来复制再发给下一个补货的人，只存哈希的话弄丢就只能删了重建。
+-- 而它允许的动作（往指定分组导入账号）并不高于库里已有的明文凭据
+-- （上游 api_key、红包 key）——拿到库的人本就能直接做这些事，明文不新增实质风险。
+-- token_prefix 用于按前缀定位候选行（与 api_tokens 同一套查询形态）。
+CREATE TABLE IF NOT EXISTS restock_pages (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  name           TEXT    NOT NULL DEFAULT '',
+  token          TEXT    NOT NULL,
+  token_prefix   TEXT    NOT NULL,
+  -- 绑定的分组（多账号池）；NULL = 默认分组（与 upstreamsvc.DEFAULT_ID 同约定）。
+  upstream_id    INTEGER,
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  expires_at     INTEGER,
+  -- 通过该页面成功导入的账号**次数**（同 uid 覆盖更新也计一次）。
+  -- 不去账号目录反查：目录里的账号会被移动 / 删除，反查出的数字既不稳定
+  -- 也回答不了「这个页面补了多少」——页面关心的是它自己的经手量。
+  imported_count INTEGER NOT NULL DEFAULT 0,
+  created_by     TEXT    NOT NULL DEFAULT '',
+  created_at     INTEGER NOT NULL,
+  last_used_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_restock_prefix ON restock_pages(token_prefix);
 """
 
 

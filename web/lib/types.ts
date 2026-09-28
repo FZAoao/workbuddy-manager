@@ -1153,6 +1153,43 @@ export interface ImportResponse {
   upstream: {id: number | null; name: string};
 }
 
+/* ── 账号补货页（管理员生成的独立导入链接）────────────── */
+
+/** 补货页列表项（不含明文 token；链接从「复制链接」入口按页取）。 */
+export interface RestockPage {
+  id: number;
+  name: string;
+  token_prefix: string;
+  /** 绑定的分组；null = 默认分组 */
+  upstream_id: number | null;
+  enabled: boolean;
+  expires_at: number | null;
+  /** 通过该页面成功导入的账号次数 */
+  imported_count: number;
+  created_by: string;
+  created_at: number;
+  last_used_at: number | null;
+  /** 仅创建时返回一次 */
+  token?: string;
+}
+
+/** 补货页公开信息（凭 URL 里的 token 换取）。 */
+export interface RestockInfo {
+  name: string;
+  upstream: {id: number | null; name: string};
+  expires_at: number | null;
+  imported_count: number;
+}
+
+/** 补货页导入响应：与面板导入同构，多一个刷新后的 imported_count。 */
+export interface RestockImportResponse {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: ImportResult[];
+  imported_count: number;
+}
+
 /* ── 开学季抽奖中奖记录 ──────────────────────────────── */
 
 /** 奖品类型：credit 积分 / voucher 实物券 / other 未知奖码 */

@@ -292,6 +292,12 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'DELETE /api/upstreams/{upstream_id}',
         'PATCH /api/upstreams/{upstream_id}',
         'POST /api/upstreams',
+        # 账号补货页：生成 / 改 / 删是**发放凭据**的动作（链接本身就是导入能力），
+        # 与建访问令牌同级，只对会话开放；公开的导入端点（/api/restock/*）不在此列
+        # ——它的鉴权是 URL 里的 token，泄不泄露取决于链接给谁。
+        'DELETE /api/restock-pages/{page_id}',
+        'PATCH /api/restock-pages/{page_id}',
+        'POST /api/restock-pages',
         # 账号分组互转：把账号文件在分组的目录之间移动——等于改「这个号属于哪个
         # 池」，与删账号同级（都会改变池的构成），只对会话开放。
         'POST /api/accounts/{filename}/move',

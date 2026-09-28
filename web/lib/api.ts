@@ -36,6 +36,9 @@ import type {
   PlaygroundModels,
   ReloadState,
   RequestLog,
+  RestockInfo,
+  RestockImportResponse,
+  RestockPage,
   Changelog,
   SecurityConfig,
   StatsSummary,
@@ -103,7 +106,7 @@ http.interceptors.response.use(
       // 路径必须带 basePath：basePath 只自动作用于 next/router 的跳转，裸的
       // window.location.href 会跳到域名根（通常 404）—— 登录页与公开页都一样。
       const loginPath = `${BASE_PATH}/login`;
-      const publicPaths = [loginPath, `${BASE_PATH}/claim`];
+      const publicPaths = [loginPath, `${BASE_PATH}/claim`, `${BASE_PATH}/restock`];
       if (!publicPaths.some((p) => path.startsWith(p))) {
         window.location.href = loginPath;
       }
@@ -489,11 +492,40 @@ export const claimApi = {
   draw: (code: string) => post<DrawResult>(`/api/claim/${encodeURIComponent(code)}`, {}),
 };
 
+/* ── 账号补货页（管理员生成的独立导入链接）───────────────
+ * 页面本身公开（鉴权 = URL 里的 token）；管理端点要会话管理员。 */
+export const restockApi = {
+  list: () => get<RestockPage[]>('/api/restock-pages'),
+  create: (body: {name: string; upstream_id: number | null; expires_at: number | null}) =>
+    post<RestockPage>('/api/restock-pages', body),
+  update: (id: number, body: {name?: string; enabled?: boolean; expires_at?: number | null}) =>
+    patch<RestockPage>(`/api/restock-pages/${id}`, body),
+  remove: (id: number) => del<{ok: boolean}>(`/api/restock-pages/${id}`),
+  /** 取某个补货页的完整链接 token（明文）。需要管理员。 */
+  link: (id: number) => get<{token: string}>(`/api/restock-pages/${id}/link`),
+};
+
+/* ── 补货页（**公开**，鉴权 = URL 里的 token，不需要登录）───── */
+export const restockPublicApi = {
+  info: (token: string) => get<RestockInfo>(`/api/restock/${encodeURIComponent(token)}`),
+  /**
+   * 导入账号 JSON。upstreamId 刻意**不传**：目标分组以补货页的绑定为准，
+   * 拿到链接的人不该能挑池。
+   */
+  import: (token: string, files: File[]) => {
+    const form = new FormData();
+    for (const f of files) form.append('files', f, f.name);
+    // **不要手动设 Content-Type**：multipart 的 boundary 必须由浏览器补上。
+    return http
+      .post<RestockImportResponse>(`/api/restock/${encodeURIComponent(token)}/import`, form)
+      .then((r) => r.data);
+  },
+};
+
 /* ── 访问令牌（管理面作用域化 API Token）──────────────────
  * 与 keyApi 是两套：那个是给下游调模型的网关密钥，这个授权管理接口。
  * 明文只在创建时返回一次。 */
-export const tokenApi = {
-  list: () => get<ApiToken[]>('/api/tokens'),
+export const tokenApi = {  list: () => get<ApiToken[]>('/api/tokens'),
   create: (body: {name: string; scope: 'readonly' | 'admin'; expires_at: number | null}) =>
     post<CreatedApiToken>('/api/tokens', body),
   update: (id: number, body: {

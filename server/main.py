@@ -15,8 +15,8 @@ from . import config, db, redpacket, security
 from .iputil import client_ip
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    redpackets, responses, security as security_router, settings, stats,
-    system, tokens, upstreams,
+    redpackets, responses, restock, security as security_router, settings,
+    stats, system, tokens, upstreams,
 )
 from .services import accountlog, renew, tasklog, taskrun
 
@@ -139,6 +139,9 @@ app.include_router(keys.router)
 app.include_router(redpackets.router)
 # 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
 app.include_router(redpackets.claim_router)
+# 账号补货页：管理员生成独立导入链接，公开端点凭 URL 里的 token 鉴权
+app.include_router(restock.router)
+app.include_router(restock.public_router)
 app.include_router(logs.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
