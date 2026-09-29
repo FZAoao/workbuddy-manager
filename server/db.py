@@ -378,6 +378,31 @@ CREATE TABLE IF NOT EXISTS upstreams (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+
+-- 公开补货链接：只授权「向绑定的账号池上传账号 JSON」。
+-- 与管理 API Token 刻意分开；明文只在创建时返回一次，库中只存 SHA-256。
+CREATE TABLE IF NOT EXISTS restock_links (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  name            TEXT    NOT NULL,
+  token_hash      TEXT    NOT NULL,
+  prefix          TEXT    NOT NULL,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  -- NULL = 默认账号池；非空 = upstreams.id。目标池由链接绑定，访客不能提交修改。
+  upstream_id     INTEGER,
+  expires_at      INTEGER,
+  -- 0 = 不限制可提交批次数；每个被后端接受的上传请求计一批。
+  max_batches     INTEGER NOT NULL DEFAULT 0,
+  used_batches    INTEGER NOT NULL DEFAULT 0,
+  -- 公开链接默认不覆盖既有 UID，管理员可按链接显式开启。
+  allow_overwrite INTEGER NOT NULL DEFAULT 0,
+  created_at      INTEGER NOT NULL,
+  created_by      TEXT    NOT NULL DEFAULT '',
+  last_used_at    INTEGER,
+  last_used_ip    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_restock_prefix ON restock_links(prefix);
+CREATE INDEX IF NOT EXISTS idx_restock_upstream ON restock_links(upstream_id);
 """
 
 

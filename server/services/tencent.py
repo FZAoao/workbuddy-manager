@@ -11,8 +11,10 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -39,6 +41,9 @@ from .realm import (
 # 记 realm 是为了在回调时校验一致——若用户先开国内版的码、又切到国际版再轮询，
 # 不校验就会把国际版的 token 写进国内版的会话流程（上游 validateRealmMatch 同此意图）。
 _state_cache: dict[str, tuple[float, Realm]] = {}
+# 在线 JSON 导入可能被多个请求并发调用。默认禁止覆盖时，存在性检查与落盘
+# 必须在同一临界区内，否则两个同 UID 请求都可能先看到“不存在”再互相覆盖。
+_import_write_lock = threading.Lock()
 
 # state 的有效期（秒）。
 #
@@ -307,6 +312,13 @@ def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
     return (auth_dir or config.AUTH_DIR) / filename
 
 
+def _validated_uid(value: object) -> str:
+    uid = str(value)
+    if not re.fullmatch(r'[0-9A-Za-z_-]{1,80}', uid):
+        raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
+    return uid
+
+
 def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
 
@@ -318,16 +330,9 @@ def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, b
     它是设备风控凭据，用户手动写入后若因换 token 重登而丢失，会静默降级风控
     形态——所以这里读旧文件保留，而不是当作字段缺失。
     """
-    uid = str(account['uid'])
-    # uid 会被拼进文件名，写入 auths 目录，所以必须先校验字符集。
-    #
-    # 它来自腾讯 `/v2/plugin/login/account` 的响应（`acct.get('uid')`），
-    # 是**外部输入**：真实 uid 是 uuid（`9b212d8c-f5f7-...`），但没有校验时
-    # `../x` 这类值会让路径拐出 auths 目录（`workbuddy-` 前缀只挡住了大部分形态，
-    # 分隔符仍能生效）。同目录下 `wb2api._safe_file` 早已对**读**路径做了同样的
-    # 白名单，这里把**写**路径补齐，两边口径一致。
-    if not re.fullmatch(r'[0-9A-Za-z_-]{1,80}', uid):
-        raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
+    # uid 会被拼进文件名，写入 auths 目录，所以必须先校验字符集。它来自
+    # 腾讯响应，是外部输入；读写路径统一走同一份白名单。
+    uid = _validated_uid(account['uid'])
     base = auth_dir or config.AUTH_DIR
     base.mkdir(parents=True, exist_ok=True)
     target = base / f'workbuddy-{uid}.json'
@@ -501,7 +506,12 @@ def _looks_cn_account(nickname: str) -> bool:
     return False
 
 
-def write_imported_auth(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
+def write_imported_auth(
+    account: dict,
+    auth_dir: Path | None = None,
+    *,
+    allow_overwrite: bool = True,
+) -> tuple[str, bool]:
     """把归一化后的导入账号落盘，**保留已有的 device_token**。
 
     与 `write_auth_file` 的差别：后者按登录响应重建整份文件、device_token 从
@@ -509,23 +519,32 @@ def write_imported_auth(account: dict, auth_dir: Path | None = None) -> tuple[st
     这里优先用它，没有才回退读旧文件。其余落盘逻辑（uid 校验、原子写、realm
     用 resolve_realm）与 `write_auth_file` 完全一致，直接复用它即可。
     """
+    uid = _validated_uid(account['uid'])
     base = auth_dir or config.AUTH_DIR
-    target = base / f"workbuddy-{account['uid']}.json"
+    target = base / f'workbuddy-{uid}.json'
     incoming_dt = str(account.get('device_token') or '').strip()
 
-    filename, existed = write_auth_file(account, auth_dir)
+    # 公开补货链接默认只准补新号。存在性检查与原子落盘必须一起加锁，避免两个
+    # 并发请求都在检查阶段看到“不存在”，随后后写者悄悄覆盖先写者。
+    with _import_write_lock:
+        # 除了正常文件，也把 `.disabled` 形态视为已存在；否则会在同一 UID 下同时
+        # 留下启用版与停用版，状态含义冲突。
+        if not allow_overwrite and (target.exists() or Path(str(target) + '.disabled').exists()):
+            raise ValueError('账号已存在，当前补货链接不允许覆盖')
 
-    # write_auth_file 只保留旧文件的 device_token；导入自带的要补回去。
-    if incoming_dt:
-        try:
-            data = json.loads(target.read_text(encoding='utf-8'))
-            if isinstance(data, dict) and data.get('device_token') != incoming_dt:
-                data['device_token'] = incoming_dt
-                _atomic_write_json(target, data)
-        except Exception:  # noqa: BLE001
-            # 补写失败不影响账号本体（device_token 缺失只是降级风控形态）
-            pass
-    return filename, existed
+        filename, existed = write_auth_file(account, auth_dir)
+
+        # write_auth_file 只保留旧文件的 device_token；导入自带的要补回去。
+        if incoming_dt:
+            try:
+                data = json.loads(target.read_text(encoding='utf-8'))
+                if isinstance(data, dict) and data.get('device_token') != incoming_dt:
+                    data['device_token'] = incoming_dt
+                    _atomic_write_json(target, data)
+            except Exception:  # noqa: BLE001
+                # 补写失败不影响账号本体（device_token 缺失只是降级风控形态）
+                pass
+        return filename, existed
 
 
 async def refresh_token(auth: dict) -> tuple[bool, str, dict]:

@@ -287,6 +287,11 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/task-logs/clear',
         'POST /api/tokens',
         'POST /api/users',
+        # 公开补货链接能把外部上传直接写进账号目录；创建、改目标/覆盖策略与撤销都
+        # 只能由真人会话执行，不能让泄露的管理 API Token 再造一条持久化写入口。
+        'DELETE /api/restock-links/{link_id}',
+        'PATCH /api/restock-links/{link_id}',
+        'POST /api/restock-links',
         # 多上游（账号池分组）：这几条带着上游的 api_key，而且能改「谁的流量走哪个池」——
         # 与 /api/settings/upstream 同级（改配置级凭据 + 影响全部账号行为），只对会话开放。
         'DELETE /api/upstreams/{upstream_id}',

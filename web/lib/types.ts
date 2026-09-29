@@ -1153,6 +1153,48 @@ export interface ImportResponse {
   upstream: {id: number | null; name: string};
 }
 
+
+/* ── 公开账号补货链接 ───────────────────────────────── */
+
+export interface RestockInfo {
+  valid: boolean;
+  name: string;
+  upstream: {id: number | null; name: string};
+  limits: {
+    max_files: number;
+    max_file_bytes: number;
+    max_request_bytes: number;
+  };
+  expires_at: number | null;
+  allow_overwrite: boolean;
+  remaining_batches: number | null;
+}
+
+export interface RestockLink {
+  id: number;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  upstream_id: number | null;
+  upstream_name: string;
+  target_available: boolean;
+  expires_at: number | null;
+  max_batches: number;
+  used_batches: number;
+  allow_overwrite: boolean;
+  created_at: number;
+  created_by: string;
+  last_used_at: number | null;
+  last_used_ip: string | null;
+}
+
+export interface CreatedRestockLink extends RestockLink {
+  /** 明文只在创建响应中出现一次，后续列表永不返回。 */
+  token: string;
+}
+
+export type RestockImportResponse = ImportResponse;
+
 /* ── 开学季抽奖中奖记录 ──────────────────────────────── */
 
 /** 奖品类型：credit 积分 / voucher 实物券 / other 未知奖码 */

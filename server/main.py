@@ -15,7 +15,7 @@ from . import config, db, redpacket, security
 from .iputil import client_ip
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    redpackets, responses, security as security_router, settings, stats,
+    redpackets, responses, restock, security as security_router, settings, stats,
     system, tokens, upstreams,
 )
 from .services import accountlog, renew, tasklog, taskrun
@@ -108,6 +108,10 @@ if config.CORS_ORIGINS:
 # 把内存占住（实测：12MB 请求体被完整缓冲并解析，没有 413）。这里统一兜住。
 # 取得比网关默认（8MB）宽松些：管理端有「保存上游配置」这类正常的大请求。
 MAX_API_BODY_BYTES = 16 * 1024 * 1024
+# 补货接口的 16 MiB 限制指 JSON 文件净大小；multipart 的 boundary / 文件名等
+# 还会额外占一点请求体。传输层多留 1 MiB，再由 accountimport 对每个文件与
+# 文件净总量做精确限制，避免合法的 16 MiB 批次先被通用中间件误杀。
+MAX_RESTOCK_BODY_BYTES = MAX_API_BODY_BYTES + 1024 * 1024
 
 
 @app.middleware('http')
@@ -124,9 +128,12 @@ async def limit_api_body(request: Request, call_next):
             declared = int(request.headers.get('content-length') or 0)
         except ValueError:
             declared = 0
-        if declared > MAX_API_BODY_BYTES:
+        limit = (MAX_RESTOCK_BODY_BYTES
+                 if request.url.path == '/api/public/restock/import'
+                 else MAX_API_BODY_BYTES)
+        if declared > limit:
             return JSONResponse(
-                {'detail': f'请求体过大（上限 {MAX_API_BODY_BYTES // 1024 // 1024} MB）'},
+                {'detail': f'请求体过大（上限 {limit // 1024 // 1024} MB）'},
                 status_code=413,
             )
     return await call_next(request)
@@ -139,6 +146,9 @@ app.include_router(keys.router)
 app.include_router(redpackets.router)
 # 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
 app.include_router(redpackets.claim_router)
+# 公开补货与其管理端分离注册：公开 Token 绝不经过/继承管理员权限。
+app.include_router(restock.public_router)
+app.include_router(restock.admin_router)
 app.include_router(logs.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)

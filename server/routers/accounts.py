@@ -13,7 +13,7 @@ from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Upload
 
 from .. import config, db, security, upstreamsvc
 from ..services import (
-    credits as creditsvc, modelcatalog, reload, tasklog, taskrun, tencent, wb2api,
+    accountimport, credits as creditsvc, modelcatalog, reload, tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 
@@ -1527,100 +1527,26 @@ async def restart(upstream_id: int | None = Query(None),
     return {'ok': ok, 'message': message}
 
 
-# 一次导入允许的最大文件数与单文件字节数。上限是防滥用（未认证不可达，
-# 但仍要防止一次点选上千个文件把内存/磁盘打满）。
-_IMPORT_MAX_FILES = 200
-_IMPORT_MAX_BYTES = 512 * 1024
-
-
 @router.post('/accounts/import')
 async def account_import(
     files: list[UploadFile] = File(...),
     upstream_id: int | None = Query(None),
     user: dict = Depends(security.require_admin),
 ) -> dict:
-    """**在线导入**账号授权 JSON（拖拽 / 选择文件，无需手工上传到服务器）。
-
-    与「扫码添加」并列的第二种加号方式：把从别处拿到的 auth JSON 直接拖进
-    弹窗即可。每个文件独立处理，逐个返回成功 / 失败原因，**不因一个坏文件
-    中断整批**——用户常常一次拖一批，其中夹杂着格式不对的很正常。
-
-    支持的 JSON 形态见 `tencent.parse_auth_json`（workbuddy2api 落盘格式 /
-    裸单条 / 数组 / login.sh 响应包壳）。落盘走 `tencent.write_imported_auth`：
-    uid 字符集校验、realm 用 resolve_realm（不含逃生门）、原子写、保留
-    device_token，与扫码路径同一套。
-
-    同名账号（同一 uid）会被**覆盖更新**（existed=True），并在结果里如实标注。
-    """
+    """在线导入账号授权 JSON；权限与目标分组在这里判定，文件处理走公共 Service。"""
     group = _group(upstream_id)
     base_dir = _require_dir(group)
-    if not files:
-        raise HTTPException(status_code=400, detail='没有收到任何文件')
-    if len(files) > _IMPORT_MAX_FILES:
-        raise HTTPException(
-            status_code=400,
-            detail=f'一次最多导入 {_IMPORT_MAX_FILES} 个文件（收到 {len(files)} 个）',
+    try:
+        return await accountimport.import_uploads(
+            files,
+            group=group,
+            auth_dir=base_dir,
+            allow_overwrite=True,
+            expose_saved_file=True,
+            expose_storage_errors=True,
         )
-
-    results: list[dict] = []
-    ok_uids: list[str] = []
-    for uf in files:
-        name = str(uf.filename or 'account.json')
-        try:
-            raw_bytes = await uf.read()
-        except Exception as exc:  # noqa: BLE001
-            results.append({'file': name, 'ok': False, 'error': f'读取失败：{exc}'})
-            continue
-        if len(raw_bytes) > _IMPORT_MAX_BYTES:
-            results.append({
-                'file': name, 'ok': False,
-                'error': f'文件过大（上限 {_IMPORT_MAX_BYTES // 1024} KB）',
-            })
-            continue
-        try:
-            parsed_json = json.loads(raw_bytes.decode('utf-8-sig'))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            results.append({'file': name, 'ok': False, 'error': f'不是有效的 JSON：{exc}'})
-            continue
-        try:
-            account = tencent.parse_auth_json(parsed_json)
-        except ValueError as exc:
-            results.append({'file': name, 'ok': False, 'error': str(exc)})
-            continue
-        try:
-            filename, existed = tencent.write_imported_auth(account, base_dir)
-        except ValueError as exc:
-            results.append({'file': name, 'ok': False, 'error': str(exc)})
-            continue
-        except OSError as exc:
-            results.append({
-                'file': name, 'ok': False,
-                'error': (f'写入失败：{exc}。请检查 {base_dir} 的目录权限'
-                          '（容器部署见 compose 里 chown 10001:10001 的说明）'),
-            })
-            continue
-        ok_uids.append(account['uid'])
-        results.append({
-            'file': name, 'ok': True,
-            'uid': account['uid'],
-            'nickname': account.get('nickname') or '',
-            'realm': account.get('realm') or 'cn',
-            'saved_file': filename,
-            'updated': existed,
-        })
-
-    # 让上游收录新账号：先等热加载、超时才重启（一次调用把整批 uid 纳入判断）。
-    for uid in ok_uids:
-        reload.request_reload_or_restart(uid, upstream=_reload_target(group))
-
-    succeeded = sum(1 for r in results if r.get('ok'))
-    return {
-        'total': len(results),
-        'succeeded': succeeded,
-        'failed': len(results) - succeeded,
-        'results': results,
-        'upstream': {'id': group['id'], 'name': group['name']},
-    }
+    except accountimport.ImportRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _fallback_why(bit_code: str, disabled: bool, group: dict | None = None) -> str:

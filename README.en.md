@@ -80,6 +80,11 @@ upstream repo is gone, and its source is now maintained here.
 ### Account management
 - **QR onboarding** — scan with WeChat / QQ; on success the account is checked in daily,
   written to an auth file, and the upstream container is reloaded
+- **Public restock page** — create a URL under **Settings → Restock links** and bind it to
+  one account pool. A supplier can then drag in multiple account JSON files without a
+  console login. Links can expire, enforce a batch quota, and control overwrites; existing
+  UIDs are protected by default, and visitors cannot inspect the pool or change the target.
+  See [Public account restocking](docs/public-restock.md)
 - **Token monitoring** — expiry progress bar with warnings under 1 hour; one-click manual
   check-in, connectivity probe and token refresh
   - The bar also shows a **"last renewed"** timestamp: remaining days get reset by a
@@ -675,7 +680,20 @@ The full list is in [`.env.example`](.env.example).
 Sign in, open **Accounts**, click **Add account** in the top right, scan with WeChat / QQ.
 On success the account is checked in, written to disk and the upstream container reloads.
 
-### 2. Distribute a key
+### 2. Create a public restock link (optional)
+
+When somebody needs to supply accounts but should not receive console access, open
+**Settings → Restock links**. Choose the target pool, optionally set an expiry and maximum
+batch count, then create the link and copy the one-time public URL. The recipient can drag
+in multiple account JSON files; existing UIDs are not overwritten by default, and a
+successful write asks the bound pool to reload.
+
+The plaintext token is shown only once. URLs may appear in browser history and proxy or
+CDN logs, so use HTTPS, set an expiry where practical, and disable or delete the link at
+once if it leaks. See [Public account restocking](docs/public-restock.md) for the complete
+limits and API details.
+
+### 3. Distribute a key
 
 Open **Keys**, click **New key** and configure as needed:
 
@@ -691,7 +709,7 @@ Open **Keys**, click **New key** and configure as needed:
 
 The key plaintext is **shown only once at creation** — save it immediately.
 
-### 3. Connect a downstream client
+### 4. Connect a downstream client
 
 Fully OpenAI-compatible; point the base URL at this service's `/v1`:
 

@@ -19,6 +19,7 @@ import {
   DownloadCloud,
   FileText,
   KeyRound,
+  PackagePlus,
 } from 'lucide-react';
 import {notify} from '@/lib/toast';
 import {getExpiryDailyGroup, setExpiryDailyGroup} from '@/lib/display-prefs';
@@ -27,7 +28,6 @@ import {t as tGlobal, tp as tpGlobal} from '@/lib/i18n';
 import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
 import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
-import {BASE_PATH} from '@/lib/base-path';
 import type {ModelInfo, ModelSource, UpstreamConfig, UserItem} from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -36,6 +36,7 @@ import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDia
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
+import {RestockLinksPanel} from '@/components/common/settings/RestockLinksPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
 import {CopyButton} from '@/components/ui/copy-button';
 import {Button} from '@/components/ui/button';
@@ -1100,6 +1101,7 @@ export default function SettingsPage() {
           <TabsTrigger value="models"><Shuffle className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabModels')}</TabsTrigger>
           <TabsTrigger value="users"><Users className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUsers')}</TabsTrigger>
           <TabsTrigger value="tokens"><KeyRound className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabTokens')}</TabsTrigger>
+          <TabsTrigger value="restock"><PackagePlus className="mr-1.5 h-3.5 w-3.5" />{t('restock.tabLabel')}</TabsTrigger>
           <TabsTrigger value="system"><DownloadCloud className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabSystem')}</TabsTrigger>
           <TabsTrigger value="changelog"><FileText className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabChangelog')}</TabsTrigger>
           <TabsTrigger value="about"><Info className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabAbout')}</TabsTrigger>
@@ -1923,6 +1925,11 @@ export default function SettingsPage() {
         {/* ═══ 访问令牌 ═══ */}
         <TabsContent value="tokens" className="mt-4 space-y-4">
           <TokensPanel />
+        </TabsContent>
+
+        {/* ═══ 公开补货链接 ═══ */}
+        <TabsContent value="restock" className="mt-4 space-y-4">
+          <RestockLinksPanel />
         </TabsContent>
 
         {/* ═══ 系统更新 ═══ */}

@@ -22,6 +22,10 @@ import type {
   IpAccessLog,
   IpRule,
   ImportResponse,
+  RestockInfo,
+  RestockLink,
+  CreatedRestockLink,
+  RestockImportResponse,
   KeyExportResult,
   KeyImportDetectResult,
   KeyImportResult,
@@ -103,7 +107,7 @@ http.interceptors.response.use(
       // 路径必须带 basePath：basePath 只自动作用于 next/router 的跳转，裸的
       // window.location.href 会跳到域名根（通常 404）—— 登录页与公开页都一样。
       const loginPath = `${BASE_PATH}/login`;
-      const publicPaths = [loginPath, `${BASE_PATH}/claim`];
+      const publicPaths = [loginPath, `${BASE_PATH}/claim`, `${BASE_PATH}/restock`];
       if (!publicPaths.some((p) => path.startsWith(p))) {
         window.location.href = loginPath;
       }
@@ -492,6 +496,41 @@ export const claimApi = {
 /* ── 访问令牌（管理面作用域化 API Token）──────────────────
  * 与 keyApi 是两套：那个是给下游调模型的网关密钥，这个授权管理接口。
  * 明文只在创建时返回一次。 */
+/* ── 公开补货与补货链接管理 ─────────────────────────── */
+export const restockApi = {
+  info: (token: string) =>
+    http.get<RestockInfo>('/api/public/restock/info', {
+      headers: {'X-Restock-Token': token},
+    }).then((r) => r.data),
+  importAccounts: (token: string, files: File[]) => {
+    const form = new FormData();
+    for (const file of files) form.append('files', file, file.name);
+    // Token 刻意放请求头，不放 query：上传后地址栏、代理 access log 与浏览器历史
+    // 都不该反复出现明文补货凭据。
+    return http.post<RestockImportResponse>('/api/public/restock/import', form, {
+      headers: {'X-Restock-Token': token},
+    }).then((r) => r.data);
+  },
+};
+
+export type RestockLinkWrite = {
+  name: string;
+  upstream_id: number | null;
+  expires_at: number | null;
+  max_batches: number;
+  allow_overwrite: boolean;
+  enabled?: boolean;
+};
+
+export const restockLinksApi = {
+  list: () => get<RestockLink[]>('/api/restock-links'),
+  create: (body: RestockLinkWrite) =>
+    post<CreatedRestockLink>('/api/restock-links', body),
+  update: (id: number, body: Partial<RestockLinkWrite>) =>
+    patch<RestockLink>(`/api/restock-links/${id}`, body),
+  remove: (id: number) => del<{ok: boolean}>(`/api/restock-links/${id}`),
+};
+
 export const tokenApi = {
   list: () => get<ApiToken[]>('/api/tokens'),
   create: (body: {name: string; scope: 'readonly' | 'admin'; expires_at: number | null}) =>
