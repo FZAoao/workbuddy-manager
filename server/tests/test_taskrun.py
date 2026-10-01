@@ -109,6 +109,14 @@ class CommandBuildTest(unittest.TestCase):
             self.assertLess(cmd.index('-u'), cmd.index(str(taskrun._script_path())),
                             f'{mode}: -u 必须在脚本路径之前')
 
+    def test_uses_compat_runner_before_upstream_script(self) -> None:
+        cmd = taskrun.build_command('full', 'ALL')
+        runner = str(Path(taskrun.__file__).with_name('taskscript.py'))
+        script = str(taskrun._script_path())
+        self.assertIn(runner, cmd)
+        self.assertLess(cmd.index(runner), cmd.index(script))
+        self.assertEqual(cmd[cmd.index(script) + 1], 'ALL')
+
     def test_unknown_mode_rejected(self) -> None:
         for bad in ('', 'FULL', 'full; rm -rf /', 'previewx', None):
             with self.assertRaises(ValueError):

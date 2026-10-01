@@ -395,7 +395,10 @@ def build_command(mode: str, target: str) -> list[str]:
     # 用户看到的就是「点了做任务，卡半天没有任何输出，然后突然冒出一大段」
     # （线上实测）。加 -u 后每行实时可见，面板才真的能当进度看。
     script = _school_script_path() if mode in _SCHOOL_MODES else _script_path()
-    return [_python(), '-u', str(script), target, *_MODE_ARGS[mode]]
+    # 通过面板自带的兼容 runner 启动：它不改上游协议，只对 list_tasks 的
+    # 临时网络失败做有限重试，并在重试耗尽时跳过当前任务而不是让整轮崩溃。
+    runner = Path(__file__).with_name('taskscript.py')
+    return [_python(), '-u', str(runner), str(script), target, *_MODE_ARGS[mode]]
 
 
 def _prepare(mode: str, target: str) -> tuple[bool, object]:
