@@ -32,6 +32,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -58,6 +59,96 @@ UPSTREAM_DIR = Path(os.environ.get('WB_UPSTREAM_DIR') or '/opt/workbuddy2api')
 UPSTREAM_PORT = int(os.environ.get('WB_UPSTREAM_PORT') or 7863)
 MANAGER_PORT = int(os.environ.get('WB_MANAGER_PORT') or 7864)
 MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
+
+
+def upstream_health_url() -> str:
+    """就绪探测用的上游健康检查地址（按部署形态取，不写死回环）。
+
+    容器部署下 manager 与上游是两个容器：宿主把上游端口发布在 127.0.0.1 上，那是
+    **宿主机**的回环，manager 容器里没有这个端口——写死回环会让探测整整 90 轮
+    connection refused、空等约 3 分钟，最后打一条「未在预期时间内就绪」的假警告
+    （上游其实早就起来了）。取值顺序：
+
+      ① `WB_UPSTREAM_HEALTH_URL` —— 整条 URL 显式指定（反代 / 子路径场景）；
+      ② `WB2API_BASE` 的 scheme+host —— 面板自己就是用这个地址访问上游的，
+         容器部署下它是容器 DNS（如 http://workbuddy2api:7863）；
+      ③ 回落 `http://127.0.0.1:{WB_UPSTREAM_PORT}/healthz` —— 宿主机原生部署。
+
+    后两条与面板 server/config.py 同源：探测地址跟着**面板实际怎么连上游**走，
+    两边不会再各说各话。
+    """
+    explicit = (os.environ.get('WB_UPSTREAM_HEALTH_URL') or '').strip()
+    if explicit:
+        return explicit
+    base = (os.environ.get('WB2API_BASE') or '').strip()
+    if base:
+        try:
+            parts = urllib.parse.urlsplit(base if '//' in base else f'http://{base}')
+            host = parts.hostname or ''
+            port = parts.port  # 端口非法时在这里抛 ValueError
+            if parts.scheme and host:
+                netloc = f'[{host}]' if ':' in host else host  # IPv6 字面量要带方括号
+                if port:
+                    netloc = f'{netloc}:{port}'
+                return f'{parts.scheme}://{netloc}/healthz'
+        except ValueError:
+            pass  # 畸形值不致命：更新流程不该因为一个地址拼不出来就中断
+    return f'http://127.0.0.1:{UPSTREAM_PORT}/healthz'
+
+
+def _probe_opener() -> urllib.request.OpenerDirector:
+    """健康探测**直连**，不走代理。
+
+    探测问的是「上游进程起来没有」。容器部署里 `WB_HTTP_PROXY` / `WB_UPDATE_PROXY`
+    往往是为拉 GitHub 配的（issue #106），而上游在容器内网——把内部地址交给代理
+    只会必失败，又变成一条假警告（与写死回环同一类错）。确需经代理才能连上上游的
+    部署，可用 `WB_UPSTREAM_HEALTH_URL` 指一个可达地址。
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+# ── 下载代理（issue #106）──────────────────────────────────────
+# 容器里能连上 api.github.com（版本检测走它）却连不上 Release 资产所在的
+# github.com / objects.githubusercontent.com 是常见情形——两条链路可达性不同。
+# 版本检测成功会把「下载不可达」掩盖成「更新器坏了」，所以这里给一个明确的旋钮。
+# 取值顺序：WB_UPDATE_PROXY（更新专用）> WB_HTTP_PROXY（面板的出口代理，
+# 用户已经为它配过代理时不必再配一遍）> 环境变量里的 http_proxy / https_proxy
+# （urllib 的默认行为）。本机地址由 no_proxy 自动放行。
+UPDATE_PROXY = (os.environ.get('WB_UPDATE_PROXY')
+                or os.environ.get('WB_HTTP_PROXY') or '').strip()
+if UPDATE_PROXY:
+    # 本机与内网不走代理：更新器要读本地状态文件，代理配置不该把内网也带偏。
+    os.environ.setdefault('no_proxy', '127.0.0.1,localhost')
+    os.environ.setdefault('NO_PROXY', os.environ['no_proxy'])
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """按配置构造 opener：设了 WB_UPDATE_PROXY 就用它，否则用环境变量默认。"""
+    handlers: list[urllib.request.BaseHandler] = []
+    if UPDATE_PROXY:
+        handlers.append(urllib.request.ProxyHandler(
+            {'http': UPDATE_PROXY, 'https': UPDATE_PROXY}))
+    handlers.append(urllib.request.HTTPSHandler())
+    return urllib.request.build_opener(*handlers)
+
+
+def _download_hint(exc: BaseException) -> str:
+    """下载失败的**可操作**提示：区分「网络到不了 GitHub」与其它原因。"""
+    text = str(exc)
+    looks_like_network = any(k in text for k in (
+        'timed out', 'Timeout', 'Remote end closed', 'Connection reset',
+        'No address associated', 'Temporary failure', 'Name or service',
+        'Connection refused', 'unreachable',
+    ))
+    if not looks_like_network:
+        return ''
+    if UPDATE_PROXY:
+        return (f'（已配置代理 {UPDATE_PROXY}，仍连不上 —— 检查代理地址是否可从本机访问、'
+                f'以及它是否放行 github.com）')
+    if urllib.request.getproxies():
+        return '（当前使用的是环境变量里的代理；若代理不可用，可用 WB_UPDATE_PROXY 指定一个）'
+    return ('（当前网络似乎无法直连 GitHub。容器/内网环境请在 .env 里设置 '
+            'WB_UPDATE_PROXY=http://<宿主IP>:<端口> 后重试，例如 http://172.17.0.1:7890）')
 UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/Sliverkiss/workbuddy2api.git'
 SERVICE_NAME = os.environ.get('WB_SERVICE_NAME') or 'workbuddy-web'
 DATA_DIR = Path(os.environ.get('WB_DATA_DIR') or INSTALL_DIR / 'data')
@@ -197,13 +288,38 @@ def run(cmd: list[str], cwd: Path | None = None, rep: Reporter | None = None,
     return proc.returncode, out
 
 
-def http_json(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers={
+def _github_headers() -> dict:
+    """GitHub API 请求头；设了 WB_GITHUB_TOKEN / GITHUB_TOKEN 则认证。
+
+    未认证限额只有 60 次/小时/IP，共享出口（TUN/系统代理）极易被同出口的
+    其他用户打满，表现为偶发 HTTP 403；认证后为 5000 次/小时。
+    """
+    headers = {
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'workbuddy-manager-updater',
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    }
+    token = (os.environ.get('WB_GITHUB_TOKEN')
+             or os.environ.get('GITHUB_TOKEN') or '').strip()
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
+def http_json(url: str, timeout: int = 20) -> dict:
+    req = urllib.request.Request(url, headers=_github_headers())
+    try:
+        with _opener().open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        # 把 GitHub 的可读原因带出来（如 "API rate limit exceeded for x.x.x.x"），
+        # 否则调用方只能打出 "HTTP 403"，无从判断是该等配额重置还是换网络
+        detail = ''
+        try:
+            detail = exc.read().decode('utf-8', errors='replace').strip()[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f'HTTP {exc.code} {exc.reason} {detail}'.strip()) from exc
+
 
 
 def download(url: str, dest: Path, rep: Reporter) -> None:
@@ -220,7 +336,7 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
     for attempt in (1, 2):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
-            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
+            with _opener().open(req, timeout=120) as resp, open(dest, 'wb') as fh:
                 shutil.copyfileobj(resp, fh)
             last = None
             break
@@ -235,7 +351,10 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
         if attempt == 1:
             rep.log(f'下载失败（{last}），自动重试一次…', 'warn')
     if last is not None:
-        raise last
+        # 只有「看着像网络到不了 GitHub」的失败才补一句可操作提示；其余照原样抛出，
+        # 保持调用方与既有测试看到的异常类型不变。
+        hint = _download_hint(last)
+        raise RuntimeError(f'{last} {hint}') if hint else last
 
     size = dest.stat().st_size
     rep.log(f'  完成（{size / 1024 / 1024:.2f} MB）')
@@ -268,8 +387,9 @@ def check_signature(archive: Path, sig_path: Path, rep: Reporter) -> None:
 
     if not sig_path.is_file():
         raise RuntimeError(
-            '该 Release 没有可用的签名文件，已拒绝安装。\n'
-            '  正常发布流程会附带 .tar.gz.sig；缺失说明发布流程可能被改动。'
+            '该 Release 尚未附带签名文件，已拒绝安装。\n'
+            '  新版本发布后需要维护者在自己的机器上签名再上传（一般几分钟到几十分钟）；'
+            '稍后重试即可，不需要改任何配置。'
         )
 
     # ssh-keygen 要求 allowed_signers 格式（纯 .pub 文件不接受）
@@ -312,21 +432,48 @@ def check_signature(archive: Path, sig_path: Path, rep: Reporter) -> None:
 
 
 def download_signature(sig_url: str, archive: Path, rep: Reporter) -> Path:
-    """下载签名文件到包旁边，返回其路径。失败时抛错（不返回"空签名"）。"""
+    """下载签名文件到包旁边，返回其路径。失败时抛错（不返回"空签名"）。
+
+    两种失败要分开说（用户报过 #127/#129）：把**网络超时**说成「该 Release 没有
+    可用的签名文件」，会把人引到「发布流程是不是被改坏了」上去，而真正该做的是
+    稍后重试。所以：
+
+      · 404 → Release 里确实没有 `.sig`（维护者签名前的窗口期就是这种）→ 明说
+        「尚未附带签名文件，稍后重试」，不要暗示发布流程被改动；
+      · 其它（超时/连接失败）→ 明说「下载失败（网络问题）」并**重试三次**——
+        GitHub 资产 CDN 偶发超时很常见（维护者本机也遇到过整包下到一半卡住）。
+    """
     sig_path = archive.with_suffix(archive.suffix + '.sig')
     if not sig_url:
         return sig_path  # 让 check_signature 报「缺少签名文件」并给出清晰指引
     rep.log('下载签名文件…')
-    try:
-        req = urllib.request.Request(sig_url, headers={'User-Agent': 'workbuddy-manager-updater'})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
-            shutil.copyfileobj(resp, fh)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f'该 Release 没有可用的签名文件，已拒绝安装：{exc}\n'
-            '  正常发布流程会附带 .tar.gz.sig；缺失说明发布流程可能被改动。'
-        ) from exc
-    return sig_path
+    last: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(sig_url,
+                                         headers={'User-Agent': 'workbuddy-manager-updater'})
+            with _opener().open(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            return sig_path
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                sig_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    '该 Release 尚未附带签名文件，已拒绝安装。\n'
+                    '  新版本发布后需要维护者在自己的机器上签名再上传（一般几分钟到几十分钟）；'
+                    '稍后重试即可，不需要改任何配置。'
+                ) from exc
+            last = exc
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        sig_path.unlink(missing_ok=True)      # 半截文件不能留给后面的验签
+        if attempt < 3:
+            rep.log(f'签名文件下载失败（{last}），第 {attempt}/3 次，稍后重试…', 'warn')
+            time.sleep(3 * attempt)
+    raise RuntimeError(
+        f'下载签名文件失败（网络问题，不是发布流程的问题）：{last}\n'
+        '  已重试 3 次。稍后再试；若一直失败，请检查这台服务器到 GitHub 的网络或代理设置。'
+    ) from last
 
 
 def verify_release_signature(archive: Path, sig_url: str, rep: Reporter) -> None:
@@ -669,12 +816,8 @@ def rebuild_upstream(rep: Reporter) -> None:
         _report_service_state(rep)
         raise RuntimeError('上游重建失败' + (f'：{hint}' if hint else '，请查看上方日志'))
 
-    # 6) 等待就绪
-    rep.log('等待上游就绪…')
-    if wait_health(f'http://127.0.0.1:{UPSTREAM_PORT}/healthz', 90, rep):
-        rep.log('上游已就绪')
-    else:
-        rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
+    # 6) 等待就绪（地址按部署形态取：容器里不是回环，见 upstream_health_url）
+    wait_upstream_ready(rep)
 
 
 def _clear_version_cache(rep: Reporter) -> None:
@@ -872,7 +1015,7 @@ def _diagnose_build_failure(out: str) -> str:
 
 def _health_ok(url: str, timeout: int = 3) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _probe_opener().open(url, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:  # noqa: BLE001
         return False
@@ -884,7 +1027,7 @@ def _report_service_state(rep: Reporter) -> None:
     构建失败时 compose 不会动已在运行的容器，因此旧版本通常仍在提供服务；
     明确告诉用户这一点，避免误以为「更新失败=服务挂了」而做多余操作。
     """
-    if _health_ok(f'http://127.0.0.1:{UPSTREAM_PORT}/healthz'):
+    if _health_ok(upstream_health_url()):
         rep.log('注意：本次重建失败，但检测到上游仍在响应——旧容器未被影响，服务正常', 'warn')
     else:
         rep.log('警告：上游健康检查未通过，请检查容器状态（docker ps / docker logs）', 'error')
@@ -982,7 +1125,7 @@ def _compose_cmd(rep: Reporter | None = None) -> list[str] | None:
 def wait_health(url: str, tries: int, rep: Reporter) -> bool:
     for _ in range(tries):
         try:
-            with urllib.request.urlopen(url, timeout=3) as resp:
+            with _probe_opener().open(url, timeout=3) as resp:
                 if resp.status == 200:
                     return True
         except Exception:  # noqa: BLE001
@@ -991,19 +1134,100 @@ def wait_health(url: str, tries: int, rep: Reporter) -> bool:
     return False
 
 
+def wait_upstream_ready(rep: Reporter) -> bool:
+    """重建后等上游就绪。
+
+    地址走 `upstream_health_url()`（按部署形态取），不要在这里写死回环——
+    容器部署下那句「未在预期时间内就绪」会变成一条与事实相反的假警告。
+    """
+    rep.log('等待上游就绪…')
+    if wait_health(upstream_health_url(), 90, rep):
+        rep.log('上游已就绪')
+        return True
+    rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
+    return False
+
+
 # ── 管理端更新 ───────────────────────────────────────────
+def fetch_release_via_api() -> dict:
+    """经 GitHub API 取最新 Release（认证后 5000 次/小时，未认证 60 次/小时/IP）。"""
+    rel = http_json(f'https://api.github.com/repos/{MANAGER_REPO}/releases/latest')
+    assets = rel.get('assets') or []
+    pkg = next((a for a in assets if str(a.get('name', '')).endswith('.tar.gz')), None)
+    if not pkg:
+        raise RuntimeError('该 Release 未提供 .tar.gz 产物')
+    sig = next((a for a in assets
+                if str(a.get('name', '')).endswith('.tar.gz.sig')), None)
+    return {
+        'tag': rel.get('tag_name') or '',
+        'pkg_url': pkg['browser_download_url'],
+        'pkg_name': Path(str(pkg.get('name') or 'pkg.tar.gz')).name,
+        'sig_url': str(sig.get('browser_download_url') or '') if sig else '',
+    }
+
+
+def fetch_release_via_redirect(latest_url: str | None = None,
+                               repo: str | None = None) -> dict:
+    """不走 GitHub API 的回退：releases/latest 的 302 重定向拿最新 tag。
+
+    API 未认证限额只有 60 次/小时/IP，共享出口（TUN/系统代理）极易被同出口
+    用户打满，表现为偶发 HTTP 403；而 github.com 的网页端与
+    releases/download 资产下载不受该配额限制。资产名按发布惯例
+    workbuddy-manager-<tag>.tar.gz 构造（历届 Release 均如此）。
+    """
+    repo = repo or MANAGER_REPO
+    req = urllib.request.Request(
+        latest_url or f'https://github.com/{repo}/releases/latest',
+        headers={'User-Agent': 'workbuddy-manager-updater'})
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener.open(req, timeout=30)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            raise RuntimeError(f'releases/latest 回退探测失败：HTTP {exc.code}') from exc
+        loc = exc.headers.get('Location') or ''
+        tag = urllib.parse.unquote(loc.split('/tag/', 1)[-1].split('?')[0].split('#')[0])
+        if not tag or '/' in tag:
+            raise RuntimeError(f'releases/latest 重定向未含有效 tag：{loc}') from exc
+    else:
+        raise RuntimeError('releases/latest 未按预期重定向（网络异常或路径变更）')
+
+    base = f'https://github.com/{repo}/releases/download/{tag}'
+    pkg_name = f'workbuddy-manager-{tag}.tar.gz'
+    return {
+        'tag': tag,
+        'pkg_url': f'{base}/{pkg_name}',
+        'pkg_name': pkg_name,
+        'sig_url': f'{base}/{pkg_name}.sig',
+    }
+
+
 def update_manager(rep: Reporter) -> None:
     rep.step('更新管理端')
 
-    # 1) 取最新 Release
+    # 1) 取最新 Release：API 优先（认证后 5000 次/小时；未认证仅 60 次/小时/IP，
+    #    共享出口极易被同出口用户打满而 403）；失败时回退到 releases/latest
+    #    的 302 重定向（不走 API、无配额限制）。
+    info: dict | None = None
+    api_error = ''
     try:
-        rel = http_json(f'https://api.github.com/repos/{MANAGER_REPO}/releases/latest')
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f'获取 Release 失败：HTTP {exc.code}') from exc
+        info = fetch_release_via_api()
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f'无法访问 GitHub API：{exc}') from exc
+        api_error = f'{type(exc).__name__}: {exc}'
+        rep.log(f'GitHub API 不可用（{api_error}），回退到 releases/latest 重定向…', 'warn')
+    if info is None:
+        try:
+            info = fetch_release_via_redirect()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f'获取 Release 失败：API {api_error}；回退路径也失败：{exc}') from exc
 
-    tag = rel.get('tag_name') or ''
+    tag = info['tag']
     rep.log(f'最新版本：{tag or "(未知)"}')
     rep.set_target_version(tag)
 
@@ -1012,26 +1236,23 @@ def update_manager(rep: Reporter) -> None:
         rep.log(f'当前已是最新版本（{tag}）')
         return
 
-    assets = rel.get('assets') or []
-    pkg = next((a for a in assets if str(a.get('name', '')).endswith('.tar.gz')), None)
-    if not pkg:
-        raise RuntimeError('该 Release 未提供 .tar.gz 产物')
-    sig = next((a for a in assets
-                if str(a.get('name', '')).endswith('.tar.gz.sig')), None)
+    pkg_name = info['pkg_name']
+    pkg_url = info['pkg_url']
+    sig_url = info['sig_url']
 
     # 2) 下载并解压到临时目录
     with tempfile.TemporaryDirectory(prefix='wbm-update-') as tmpdir:
         tmp = Path(tmpdir)
-        # 只用文件名部分：pkg['name'] 来自网络响应，虽然 GitHub 不允许名字含
-        # 路径分隔符，但"用远端数据拼本地路径"与早前的路径穿越是同一类错误，
-        # 这里按同名原则做净化（Path(...).name 会丢掉任何目录成分）
-        archive = tmp / Path(str(pkg.get('name') or 'pkg.tar.gz')).name
-        download(pkg['browser_download_url'], archive, rep)
+        # pkg_name 已在 fetch_release_via_api / fetch_release_via_redirect 里按
+        # 同名原则净化（Path(...).name 丢掉任何目录成分）：下载地址来自网络
+        # 响应，"用远端数据拼本地路径"与早前的路径穿越是同一类错误
+        archive = tmp / pkg_name
+        download(pkg_url, archive, rep)
 
         # 验签必须在下解压之前：先确认「这个包是你签的」，再谈包里的内容
         verify_release_signature(
             archive,
-            str(sig.get('browser_download_url') or '') if sig else '',
+            sig_url,
             rep,
         )
 

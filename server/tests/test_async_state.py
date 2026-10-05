@@ -39,6 +39,7 @@ _LOGS = _MAIN / 'logs' / 'page.tsx'
 _STATS = _MAIN / 'stats' / 'page.tsx'
 _SECURITY = _MAIN / 'security' / 'page.tsx'
 _TASKS = _MAIN / 'tasks' / 'page.tsx'
+_KEYS = _MAIN / 'keys' / 'page.tsx'
 _NODE = shutil.which('node')
 
 # 接入状态系统的页面 → 它们在「数据还没到」时会说的那些谎话。
@@ -72,7 +73,42 @@ _PAGES_WITH_LIES = {
         "t('tasks.noTaskRecords')",       # 「暂无自动任务记录」——等于说采集器没跑过
         "t('tasks.rawLogNote')",          # 上游原始日志的「这里没有记录不代表没执行」
     ],
+    'keys/page.tsx': [
+        "t('keys.emptyTitle')",           # 「暂无 API 密钥」——在讲凭据的页面上，
+                                          # 这句读起来是「我的密钥被删了」，用户会顺手重建
+    ],
+    # 批次 4 起，设置页的外壳在 `layout.tsx`（7 个 Tab 变成 `/settings/<tab>`
+    # 子路由，而子路由的 page 每次跳转都会重挂载——取数与表单状态必须放在
+    # 不重挂载的 layout 上，见那个文件顶部的说明）。`page.tsx` 现在只是把
+    # `/settings` 重定向到第一个 Tab，所以这条不变式跟着换到了新路径。
+    'settings/layout.tsx': [
+        "t('settings.usersEmpty')",       # 「暂无管理用户」——等于说系统里一个账号都没有
+    ],
+    'accounts/page.tsx': [
+        "t('accounts.emptyTitle')",       # 「暂无账号」——等于说号池是空的
+        "t('accounts.emptyRealmTitle'",   # 「<版本> 没有账号」——同样是「没有」，只是限定到版本
+        "t('accounts.noMatchTitle')",     # 「没有匹配的账号」——筛选结果是空的，前提是清单已经取到
+    ],
+    'models/page.tsx': [
+        "t('models.noModels')",           # 「暂无模型」——等于说腾讯那边没有可用模型
+        "t('models.noMatch')",            # 「没有匹配的模型」——筛选结果是空的，前提是清单已经取到
+    ],
+    'red-packets/page.tsx': [
+        "t('redPacket.empty')",           # 「暂无红包」——等于说红包发完了/被清了
+    ],
 }
+
+# 「首屏守卫」的判据写法**不唯一**，取决于主数据是不是页面的全部数据：
+#   · dashboard / logs / stats / playground / security / tasks —— 页面上要的那几份
+#     就是全部，一份都没到就不该渲染，于是直接用 useAsyncAll 的
+#     `isInitialFailed || isInitialLoading`；
+#   · settings —— 主数据只有 `cfg` 一份（模型映射、用户各自渲染在自己的 Tab 里），
+#     它没到就不能渲染那张配置表单，判据是 `if (!cfg)`。
+# 两者表达的是同一件事（主数据没就绪就不往下渲染），所以这里接受任一写法。
+_GUARD_MARKERS = (
+    'isInitialFailed || isInitialLoading',
+    'if (!cfg)',
+)
 
 # 只跑 .mjs，不碰 .ts —— Node 的 type stripping 从 22.6 起才有
 _MIN_MAJOR = 22
@@ -208,17 +244,39 @@ class AsyncStateInvariantTest(unittest.TestCase):
                          '变化，翻页 / 改时段不会重取（点了没反应）')
 
     def test_logs_keeps_rows_while_paging(self) -> None:
-        """日志页必须把「页码 / 天数」放进**第三**个参数（静默重取）。
+        """日志页必须把「页码 / 天数 / 各筛选项」放进**第三**个参数（静默重取）。
 
         第二组依赖（deps）的语义是「换了一个数据上下文」——变了就清空重取、显示骨架。
         页码若被放进去，**每翻一页都会闪一次骨架**；而翻页是高频操作，看起来像
-        页面在抽搐。所以 page / days 必须走第三组 refreshDeps，realm 走第二组。
+        页面在抽搐。所以 realm 走第二组，page / days / 各筛选项走第三组。
+
+        反过来，筛选项**漏**进第三组就是 P1-4 的原始形态：五个控件里只有「天数」在
+        依赖数组里，其余四个只在点「查询」时生效——同一排控件有两种脾气，能选、能改、
+        列表不动、也不报错。批次 3 把四个筛选项接进了依赖，这条断言同时钉住两个方向。
+
+        ⚠️ 局限：这里只检查**已知的六个**名字在不在第三组里。新加的第七个筛选控件不在
+        名单上，所以这条断言抓不到它（要抓「新增了控件却忘了进依赖」得解析 JSX 与依赖
+        数组的对应关系，不值当）。它抓的是**现有六个被摘掉**。
         """
         code = _code(_LOGS)
-        self.assertRegex(
-            code, r'\[realm\],\s*\n\s*\[page, days\],',
-            'logs 页的依赖分组不对：page/days 应作为第三个参数（变了只重取、不清空），'
-            'realm 作为第二个参数（变了清空重取）。放错会让每次翻页都闪一次骨架。',
+        args = _hook_args(code, 0)
+        self.assertGreaterEqual(len(args), 3, '找不到 logs 页 useAsyncAll 的三个参数')
+        context, query = args[1], args[2]
+        self.assertIn('realm', context,
+                      'logs 页没把 realm 放进第二组依赖（换了版本要清空重取）')
+        for dep in ('page', 'days'):
+            self.assertNotIn(
+                dep, context,
+                f'{dep} 被放进了第二组依赖：每次翻页 / 改时段都会清空重取、闪一次'
+                '骨架，看起来像页面在抽搐',
+            )
+        missing = [d for d in ('page', 'days', 'keyId', 'status', 'modelQ', 'ipQ')
+                   if d not in query]
+        self.assertEqual(
+            missing, [],
+            f'这些筛选 / 翻页条件不在第三组依赖里：{missing}。不在依赖里的筛选项'
+            '**改了不会重取**，控件成了装饰（P1-4 的原始形态）；文本类'
+            '（modelQ / ipQ）要用**防抖落定值**，不是输入框的即时值。',
         )
 
     def test_stats_keeps_upstream_out_of_the_main_group(self) -> None:
@@ -260,7 +318,10 @@ class AsyncStateInvariantTest(unittest.TestCase):
         for rel, lies in _PAGES_WITH_LIES.items():
             with self.subTest(page=rel):
                 code = _code(_MAIN / rel)
-                guard = code.find('isInitialFailed || isInitialLoading')
+                # 取各候选写法里**最早**出现的位置：文件里可能同时出现两种（例如
+                # settings 的注释里提到过另一种），取最早的那个才是真正的守卫。
+                hits = [i for i in (code.find(m) for m in _GUARD_MARKERS) if i >= 0]
+                guard = min(hits) if hits else -1
                 self.assertGreaterEqual(guard, 0, f'{rel} 没有首屏守卫（骨架/错误分支）')
                 self.assertIn('LoadError', code, f'{rel} 没有把加载失败显示出来')
                 for lie in lies:
@@ -506,6 +567,77 @@ class TasksPageHonestyTest(unittest.TestCase):
                 code, rf'totalUnknown=\{{{key}Failed\s*&&\s*!{var}\.length\}}',
                 f'任务记录页的 {key} 面板页脚没有在取数失败时收起来——会显示「共 0 条」，'
                 '等于告诉用户「确实一条都没有」',
+            )
+
+
+class KeysPageHonestyTest(unittest.TestCase):
+    """密钥页「宁可说不知道，也不说没有」的不变式。
+
+    这一页讲的是**凭据**，所以「暂无 API 密钥」比别的页面更危险。它不像「暂无日志」
+    那样只是少了个列表——用户看到这几个字的第一反应是「我的密钥被删了」，第二反应
+    是顺着旁边的「新建密钥」按钮重建一个。于是**建出重复密钥**，而重复密钥会让
+    「按密钥限额」「按密钥统计用量」全都对不上，用户还很难联想到是这一步造成的。
+
+    这正是 2026-09-16 那次修复要防的事（`keys.createdButRefreshFailed`：创建成功、
+    列表却没刷新出来时必须说清「已经建好了，别重复建」）——只不过那次堵的是
+    **写之后**那个门，这里堵的是**打开页面时**那个门。同一句谎话有两个入口。
+    """
+
+    def test_not_loaded_is_not_the_same_as_empty(self) -> None:
+        """列表没取到时不得说「暂无 API 密钥」。
+
+        两条防线，对应两种进入方式：
+
+        1. **首屏那一次就失败**：`isInitialFailed` → 整页错误态 + 重试，内容区
+           根本不渲染。这一条的**顺序**由
+           `test_pages_guard_before_rendering_empty_states` 钉住。
+        2. **之前取到过、这次刷新失败**：`isInitialFailed` 为假（`hasData` 还是真的），
+           但 `errors` 里有 `keys`——手上这份列表可能已经旧了，这时说「你没有密钥」
+           同样没有依据。`keysFailed` 就是为这一种留的。
+
+        为什么是 `keysFailed` 而不是 `partialFailed`：`partialFailed` 的语义是
+        「任一字段失败」。上游列表挂掉时密钥列表本身是好的，那种情况**应该**照常
+        显示「暂无密钥」；用 `partialFailed` 会把一个正常的空列表也藏起来，
+        用户反而以为页面坏了。
+        """
+        code = _code(_KEYS)
+        self.assertRegex(
+            code, r"keysFailed\s*=\s*'keys'\s*in\s*errors",
+            '密钥页没有从 errors 里算出 keysFailed——「没取到」与「确实为空」就分不开了',
+        )
+        at = code.find("t('keys.emptyTitle')")
+        self.assertGreaterEqual(at, 0, '找不到「暂无密钥」这句，断言前提不成立')
+        # 只看这句话**近旁**的条件：全文搜 `!keysFailed` 的话，把它挪到别处
+        # （比如某个跟列表无关的分支上）也会通过，等于没断言。
+        near = code[max(0, at - 400):at]
+        self.assertIn(
+            '!keysFailed', near,
+            '密钥页的空状态没有按 keysFailed 收窄——刷新失败时会显示成「暂无 API 密钥」，'
+            '用户会以为密钥被删了，并顺手重建出重复密钥',
+        )
+
+    def test_failed_list_does_not_render_a_count(self) -> None:
+        """列表没取到时，两个 tab 上的数字也要一起收起来。
+
+        这是同一句谎话的另一半，也是最容易漏的一半：空状态已经被挡掉了，tab 上却
+        还挂着「普通密钥 · 0」——列表取不到时 `keys` 就是空的，那个 0 没有依据，
+        读起来仍然是「一个密钥都没有」。任务记录页的「共 0 条」正是同一处
+        （PR #97 才补上），只是换了个位置。
+
+        判据同样是 `keysFailed`（**这一份**失败没）而不是 `partialFailed`
+        （有任一份失败没）：上游列表挂掉时密钥列表是好的、确实为空，那两个 0 是
+        如实的，必须照常显示——真实浏览器验收里正好用这一对反过来验证判据。
+
+        ⚠️ 窗口只能开得很窄（60 字符）。第一版写成 160，结果把守卫从 tabNormal 上
+        摘掉、测试**照样绿**：`!keysFailed` 在 160 字外属于**另一个** tab，正则够得着
+        它。这正是「守卫在别处也能通过」那类空转，靠变异测试才露出来。
+        """
+        code = _code(_KEYS)
+        for key in ('tabNormal', 'tabPacket'):
+            self.assertRegex(
+                code, rf"t\('keys\.{key}'\)[\s\S]{{0,60}}?!keysFailed",
+                f'密钥页 {key} 的数字没有按 keysFailed 收起来——列表没取到时它会显示'
+                '「· 0」，等于说「一个密钥都没有」',
             )
 
 

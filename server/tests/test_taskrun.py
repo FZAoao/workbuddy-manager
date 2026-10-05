@@ -596,7 +596,7 @@ class EventLoopResponsivenessTest(unittest.TestCase):
         差异钉住，免得「都改成 async」这个结论被无意改回去。
         """
         ticks = self._heartbeat_during(
-            lambda: asyncio.to_thread(lambda: None), 0.0)  # 占位：正常情况
+            lambda: asyncio.sleep(0.06), 0.0)  # 占位：正常情况
         self.assertGreater(ticks, 0)
 
         async def call_sync() -> None:

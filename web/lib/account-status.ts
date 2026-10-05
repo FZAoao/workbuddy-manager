@@ -147,6 +147,73 @@ export function rateLimitedModels(a: Account): {model: string; reason: string}[]
     .map((m) => ({model: m.model, reason: String(m.reason ?? '')}));
 }
 
+/**
+ * 展示用的**4 组**语义（P1-3）：把上面 9 个细分档收敛成用户一眼能扫过的 4 类。
+ *
+ * 为什么需要收敛：9 档的差别（面板停用 vs 上游手动停用、限流退避 vs 连败降权……）
+ * 对**排查单个账号**有用，对「这一池子有没有问题」却是噪音——用户要的是「哪些号
+ * 得我去管」。而且分档文案原先只挂在徽章的 hover 提示里，移动端没有 hover，
+ * 等于状态信息不可见；收敛成 4 组之后就能摆成**可点的筛选项**，不再依赖 hover。
+ *
+ * 归组判据（刻意不按「严重程度」排，而按**该谁动手**分）：
+ *
+ *  · `usable`  —— 正常在线。用户不用管。
+ *  · `cooling` —— 冷却中（含连败降权）。**该等**，除非降权（那说明号在持续失败）。
+ *  · `stopped` —— 两种停用机制。这是**用户自己摘的号**，不是故障；归进「需处理」
+ *    会催着他去修一个他故意关掉的东西。
+ *  · `attention` —— 其余：上游硬禁用 / 令牌过期 / 一直失败 / 不在池里 / **状态未知**。
+ *    都**得有人去查**。`unknown`（这次没取到上游状态）放这里是有意的：没有任何
+ *    依据说这些号有问题，但「看不到上游」这件事本身就需要人去查，把它塞进
+ *    `usable` 才是真的说谎（那等于说「一切正常」，而我们根本没看到）。
+ */
+export type AvailabilityGroup = 'usable' | 'attention' | 'cooling' | 'stopped';
+
+/** 4 组的固定顺序（筛选项按这个顺序排：先正常、再要处理的、最后是用户自己关的） */
+export const AVAILABILITY_GROUPS: readonly AvailabilityGroup[] = [
+  'usable',
+  'attention',
+  'cooling',
+  'stopped',
+];
+
+/** 细分档 → 展示分组 */
+export function availabilityGroup(tier: AvailabilityTier): AvailabilityGroup {
+  switch (tier) {
+    case 'online':
+      return 'usable';
+    case 'cooling':
+      return 'cooling';
+    case 'disabledByPanel':
+    case 'manualDisabled':
+      return 'stopped';
+    case 'disabled':
+    case 'expired':
+    case 'neverSucceeded':
+    case 'notLoaded':
+    case 'unknown':
+      return 'attention';
+  }
+}
+
+/**
+ * 4 组的文案键。
+ *
+ * 写成 switch + 字面量（而不是 `` `accounts.group${…}` `` 拼出来）是为了**可检索**：
+ * 拼出来的键在代码里搜不到，改文案时只能靠猜。同文件下面那些函数也是这个写法。
+ */
+export function availabilityGroupLabelKey(group: AvailabilityGroup): string {
+  switch (group) {
+    case 'usable':
+      return 'accounts.groupUsable';
+    case 'attention':
+      return 'accounts.groupAttention';
+    case 'cooling':
+      return 'accounts.groupCooling';
+    case 'stopped':
+      return 'accounts.groupStopped';
+  }
+}
+
 /** 该账号的可用性分档（顺序即优先级，见模块注释）。 */
 export function availabilityOf(a: Account): AvailabilityTier {
   // 面板主动停用要**先于**其它判定：这类账号必然不在池里（上游不加载它），
@@ -222,6 +289,11 @@ export function availabilityTitleKey(tier: AvailabilityTier): string | null {
       return 'accounts.badgeDisabledByPanelTitle';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabledTitle';
+    // 系统自动禁用（12153 连败 / 11140 被封）必须给出**下一步**：只说「已禁用」
+    // 用户不知道能做什么。点「启用」现在会连同系统禁用位一起解除（面板会调上游
+    // 的 revive 端点）——这一点以前不成立，所以老提示只能写「重新登录」。
+    case 'disabled':
+      return 'accounts.badgeDisabledTitle';
     default:
       return null;
   }

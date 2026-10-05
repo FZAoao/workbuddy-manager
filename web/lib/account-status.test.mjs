@@ -23,8 +23,11 @@
  * issue #94 问题 2 的形态。
  */
 import {
+  AVAILABILITY_GROUPS,
   accountGroups,
   accountKey,
+  availabilityGroup,
+  availabilityGroupLabelKey,
   availabilityOf,
   degradedCount,
   interleave,
@@ -249,6 +252,69 @@ check(
   'status 为 null → known 为假（界面据此显示「—」而不是 0）',
   poolTotals(null, 'cn'),
   {total: 0, healthy: 0, cooling: 0, disabled: 0, known: false, globalOnly: false},
+);
+
+/* ── 4 组展示语义（P1-3） ────────────────────────────────────────
+ *
+ * 收敛本身是「给人看的」：9 档的差别对排查单个账号有用，对「这一池子有没有问题」
+ * 是噪音。但它有两个会静默出错的点，所以钉在这里：
+ *   · 有一个档位没被归组 → 那个账号在**所有**筛选下都不出现（列表里少一条，
+ *     而且不会报错）；
+ *   · 有一个组没有任何档位映射过来 → 那个筛选按钮永远是 0，是个死按钮。
+ * 另外「用户自己停用的号」必须与「需要处理的号」分开：前者不是故障，混进去会
+ * 催着用户去修一个他故意关掉的东西。
+ */
+const ALL_TIERS = [
+  'disabled',
+  'disabledByPanel',
+  'manualDisabled',
+  'expired',
+  'unknown',
+  'cooling',
+  'neverSucceeded',
+  'notLoaded',
+  'online',
+];
+
+check(
+  '9 个细分档全部归到 4 组里（没有漏掉的档位）',
+  ALL_TIERS.filter((t) => !AVAILABILITY_GROUPS.includes(availabilityGroup(t))),
+  [],
+);
+check(
+  '4 组都至少有一个档位映射过来（没有永远是 0 的死按钮）',
+  AVAILABILITY_GROUPS.filter(
+    (g) => !ALL_TIERS.some((t) => availabilityGroup(t) === g),
+  ),
+  [],
+);
+check('在线 → 可用', availabilityGroup('online'), 'usable');
+check('冷却中 → 冷却中', availabilityGroup('cooling'), 'cooling');
+check(
+  '用户自己摘的号 → 已停用（不是「需处理」：那是他故意的，不是故障）',
+  [availabilityGroup('disabledByPanel'), availabilityGroup('manualDisabled')],
+  ['stopped', 'stopped'],
+);
+check(
+  '上游硬禁用 / 过期 / 一直失败 / 不在池里 / 状态未知 → 需处理',
+  [
+    availabilityGroup('disabled'),
+    availabilityGroup('expired'),
+    availabilityGroup('neverSucceeded'),
+    availabilityGroup('notLoaded'),
+    availabilityGroup('unknown'),
+  ],
+  Array(5).fill('attention'),
+);
+check(
+  '4 组的文案键是字面量（可检索），且与组名一一对应',
+  AVAILABILITY_GROUPS.map(availabilityGroupLabelKey),
+  [
+    'accounts.groupUsable',
+    'accounts.groupAttention',
+    'accounts.groupCooling',
+    'accounts.groupStopped',
+  ],
 );
 
 console.log(failed ? `\n${failed} failed` : '\nall passed');

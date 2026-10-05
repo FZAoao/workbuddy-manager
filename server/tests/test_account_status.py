@@ -93,10 +93,20 @@ class AccountStatusBehaviourTest(unittest.TestCase):
                          f'需要 node ≥ {_MIN_MAJOR}（type stripping），当前 {_MAJOR}')
     def test_availability_and_aggregation(self) -> None:
         self.assertTrue(_SCRIPT.is_file(), f'缺少测试脚本: {_SCRIPT}')
-        proc = subprocess.run(
-            [_NODE, '--experimental-strip-types', str(_SCRIPT)],
-            capture_output=True, text=True, timeout=120, cwd=str(_ROOT),
-        )
+
+        def run_once() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [_NODE, '--experimental-strip-types', str(_SCRIPT)],
+                capture_output=True, text=True, timeout=120, cwd=str(_ROOT),
+            )
+
+        proc = run_once()
+        # Node 偶发**进程级崩溃**（实测在整套测试并跑时出现过 0xC0000409，单跑与重跑
+        # 都正常），那既不是断言失败、也与被测逻辑无关，却会把整批测试染红。
+        # 只对「异常退出码」重试一次；脚本自己判失败（rc=1）不重试 ——
+        # 否则这条守卫就变成「跑两遍总能绿」的空转。
+        if proc.returncode not in (0, 1):
+            proc = run_once()
         out = (proc.stdout or '') + (proc.stderr or '')
         self.assertEqual(proc.returncode, 0, f'账号状态/聚合逻辑不符合预期：\n{out}')
         self.assertIn('all passed', out, f'脚本没有跑到通过：\n{out}')

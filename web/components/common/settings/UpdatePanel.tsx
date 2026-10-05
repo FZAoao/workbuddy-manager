@@ -14,6 +14,7 @@ import {
   ShieldOff,
   Sparkles,
   Terminal,
+  Trash2,
   X,
   XCircle,
 } from 'lucide-react';
@@ -73,6 +74,8 @@ export function UpdatePanel() {
    * 不依赖 finished_at 是否存在，避免时间戳缺失时关不掉。
    */
   const [resultDismissed, setResultDismissed] = useState(false);
+  /** 清除上次更新记录（issue #105）在途状态 */
+  const [clearBusy, setClearBusy] = useState(false);
   /** 上游版本固定输入（空 = 跟随分支） */
   const [refInput, setRefInput] = useState('');
   const [refBusy, setRefBusy] = useState(false);
@@ -149,6 +152,28 @@ export function UpdatePanel() {
     () => (logs.length ? logs.map((l) => l.text).join('\n') : status?.log_tail || ''),
     [logs, status?.log_tail],
   );
+  /** 上一次更新已经结束（成功或失败）——有结果可清除 */
+  const hasResult = !!status && !status.running && status.ok !== null;
+
+  /**
+   * 清除上次更新的结果与日志（issue #105）。
+   *
+   * 此前只能靠「再发起一次更新」覆盖：状态文件与 update.log 都留着，那条
+   * 「更新未完成」和日志永远擦不掉。更新进行中后端会拒绝（409），这里也把入口收起来。
+   */
+  async function clearResult() {
+    setClearBusy(true);
+    try {
+      await systemApi.clearUpdateStatus();
+      notify.ok(t('updatePanel.cleared'));
+      setResultDismissed(false);
+      await load();
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setClearBusy(false);
+    }
+  }
 
   async function start(target: 'manager' | 'upstream' | 'both') {
     setBusy(true);
@@ -292,6 +317,15 @@ export function UpdatePanel() {
                     <span className="font-medium text-foreground">{check.manager.latest}</span>
                   </div>
                 )}
+                {/* 签名未就绪：发布后到维护者签名之间有个窗口期，这时更新一定会被
+                    拒绝。先说清楚、并把按钮收起来，比让人点下去看到「已拒绝安装」好
+                    （issue #127/#129）。签名上传后最迟五分钟、或点一次刷新就会恢复。 */}
+                {check.manager.has_update && check.manager.sig_ready === false && (
+                  <div className="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{t('updatePanel.sigPending')}</span>
+                  </div>
+                )}
                 {check.upstream.has_update && (
                   <div className="space-y-1 text-[11px] text-muted-foreground">
                     <div>
@@ -373,7 +407,10 @@ export function UpdatePanel() {
                 <Button
                   size="sm"
                   className="rounded-full"
-                  disabled={!isAdmin || busy || running}
+                  // 签名未就绪时不放行：这条路必然以「已拒绝安装」收场，让用户点了
+                  // 再失败只是把同一条信息换个地方说（见上方提示）。
+                  disabled={!isAdmin || busy || running || check.manager.sig_ready === false}
+                  title={check.manager.sig_ready === false ? t('updatePanel.sigPending') : undefined}
                   onClick={async () => {
                     setBusy(true);
                     try {
@@ -600,34 +637,60 @@ export function UpdatePanel() {
         </div>
       </div>
 
-      {/* 日志 */}
-      <div className="rounded-[20px] bg-muted p-4">
-        <div className="mb-2 flex items-center justify-between">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <Terminal className="h-4 w-4" />
-            {t('updatePanel.logTitle')}
+      {/* 日志。**没有可看的内容时不渲染这块**（issue #105：一次失败会长期驻留，
+          清掉记录后这里还应整块消失，而不是永远挂着一个空框）。 */}
+      {(logText || running || hasResult) && (
+        <div className="rounded-[20px] bg-muted p-4">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Terminal className="h-4 w-4" />
+              {t('updatePanel.logTitle')}
+            </div>
+            <div className="flex items-center gap-2">
+              {logs.length > 0 && (
+                <Badge variant="secondary" className="rounded-full text-[10px]">
+                  {t('updatePanel.logLines', {count: logs.length, n: logs.length})}
+                </Badge>
+              )}
+              {/* 清除上次更新的结果与日志。更新进行中不给入口（后端也会拒绝）。 */}
+              {!running && (logText || hasResult) && (
+                <ConfirmDialog
+                  title={t('updatePanel.clearResultTitle')}
+                  description={t('updatePanel.clearResultDesc')}
+                  confirmText={t('updatePanel.clearResult')}
+                  destructive
+                  onConfirm={clearResult}
+                  trigger={
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 rounded-full px-2 text-[11px] text-muted-foreground"
+                      disabled={clearBusy}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      {t('updatePanel.clearResult')}
+                    </Button>
+                  }
+                />
+              )}
+            </div>
           </div>
-          {logs.length > 0 && (
-            <Badge variant="secondary" className="rounded-full text-[10px]">
-              {t('updatePanel.logLines', {count: logs.length, n: logs.length})}
-            </Badge>
+          {logText ? (
+            <div
+              ref={logRef}
+              className="scroll-slim max-h-[320px] overflow-auto rounded-2xl bg-background/60 p-3"
+            >
+              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-muted-foreground">
+                {logText}
+              </pre>
+            </div>
+          ) : (
+            <div className="rounded-2xl bg-background/60 px-3 py-8 text-center text-xs text-muted-foreground">
+              {t('updatePanel.logEmpty')}
+            </div>
           )}
         </div>
-        {logText ? (
-          <div
-            ref={logRef}
-            className="scroll-slim max-h-[320px] overflow-auto rounded-2xl bg-background/60 p-3"
-          >
-            <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-muted-foreground">
-              {logText}
-            </pre>
-          </div>
-        ) : (
-          <div className="rounded-2xl bg-background/60 px-3 py-8 text-center text-xs text-muted-foreground">
-            {t('updatePanel.logEmpty')}
-          </div>
-        )}
-      </div>
+      )}
     </div>
   );
 }

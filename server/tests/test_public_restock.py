@@ -473,11 +473,13 @@ class PublicRestockTest(unittest.TestCase):
         with mock.patch.object(tencent, 'poll_login', return_value=ready) as poll, \
              mock.patch.object(tencent, 'registration_status', return_value=(False, '')) , \
              mock.patch.object(tencent, 'submit_region', return_value=(True, '')) as register, \
+             mock.patch.object(tencent, 'claim_trial', return_value=(True, '')) as trial, \
              mock.patch.object(reload, 'request_reload_or_restart'):
             response = self._oauth_poll(link['token'])
         self.assertEqual(response.json()['status'], 'success', response.text)
         poll.assert_awaited_once_with('public-state', 'global')
         self.assertEqual(register.call_args.args[1], 'HK')
+        trial.assert_awaited_once()
         saved = json.loads((config.AUTH_DIR / 'workbuddy-global-oauth.json').read_text())
         self.assertEqual(saved['auth']['realm'], 'global')
 

@@ -3,14 +3,18 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
+import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
 import {keyApi, upstreamsApi, errText} from '@/lib/api';
 import {BASE_PATH} from '@/lib/base-path';
 import type {ApiKey, KeyImportResult, KeyImportStatus, UpstreamEndpoint} from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {LoadError} from '@/components/common/states/LoadError';
+import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {useRealm, type Realm} from '@/lib/realm-context';
 import {Button} from '@/components/ui/button';
@@ -86,13 +90,43 @@ function toLines(v: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * 取数完成前的空值。必须是模块级同一份：写成 `values.keys ?? []` 的话每次渲染都会
+ * 新建数组，进下游的依赖后每帧都变（同 dashboard / security 的处理）。
+ */
+const EMPTY_KEYS: ApiKey[] = [];
+const EMPTY_UPSTREAMS: UpstreamEndpoint[] = [];
+
 export default function KeysPage() {
   const t = useT();
   const {isAdmin} = useAuth();
   const {realm, label: realmName} = useRealm();
-  const [keys, setKeys] = useState<ApiKey[]>([]);
-  // 上游列表：新建/编辑弹窗的「上游」下拉需要它；为空时下拉只有「默认上游」一项
-  const [upstreams, setUpstreams] = useState<UpstreamEndpoint[]>([]);
+  /**
+   * 密钥列表 + 上游列表。**两份数据放同一个 hook，不拆。**
+   *
+   * 为什么这里与 `tasks` / `stats` 相反（那两页把「配件」单独拆出去）：上游列表不是
+   * 配件，它是**弹窗里那个「上游」下拉的全部内容**。分开取会出现「弹窗已经打开、
+   * 下拉里却只有『默认上游』」——用户会以为没有别的上游可绑，于是把密钥绑到默认池上。
+   * 那是**静默的错误选择**，比「两块一起挂掉」更糟。所以宁可同生共死：
+   * 一份没取到 → 整页错误态 + 重试，而不是渲染一个缺选项的表单。
+   */
+  const {values, errors, isInitialLoading, isInitialFailed, isRefreshing, reload} = useAsyncAll({
+    keys: () => keyApi.list(),
+    upstreams: () => upstreamsApi.list(),
+  }, []);
+
+  const keys: ApiKey[] = values.keys ?? EMPTY_KEYS;
+  const upstreams: UpstreamEndpoint[] = values.upstreams?.items ?? EMPTY_UPSTREAMS;
+  /**
+   * 密钥列表**这一份**没取到。
+   *
+   * 两种进入方式：① 首屏那次就失败——若上游列表也没成功，整页错误态会先返回，
+   * 走不到下面；② 首屏成功了、之后这次刷新失败。用来把「没有密钥」与「不知道有
+   * 没有密钥」分开——两者都渲染成同一片空白，含义却正好相反。见下面空状态处的说明。
+   */
+  const keysFailed = 'keys' in errors;
+  /** 有字段没刷新成功：常驻提示，但**不**顶掉已经显示出来的内容 */
+  const partialFailed = Object.keys(errors).length > 0;
   /**
    * 列表分组。红包一次生成一批、额度零碎，与手工建的混在一起很难看。
    *
@@ -100,7 +134,6 @@ export default function KeysPage() {
    * 红包那批是「发完就不太管」的；把它们混在首屏反而把常用的挤下去了。
    */
   const [tab, setTab] = useState<'normal' | 'packet'>('normal');
-  const [loading, setLoading] = useState(true);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ApiKey | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
@@ -164,35 +197,6 @@ export default function KeysPage() {
    */
   const submitting = useRef(false);
 
-  /**
-   * 拉取密钥列表。**返回是否成功** —— 调用方需要区分这两种失败。
-   *
-   * 为什么不能吞掉异常了事：创建成功后要刷新列表，若刷新失败而这里已把异常
-   * 吃掉，`load().catch(...)` 永远不会触发，用户看到的是「创建失败」——于是
-   * 他会再点一次，建出重复密钥（正是要避免的）。所以这里如实返回结果，
-   * 由调用方决定怎么提示。
-   */
-  const load = useCallback(async (): Promise<boolean> => {
-    setLoading(true);
-    try {
-      // 上游列表与密钥**一起**取：弹窗里的下拉要用它，分开取会出现
-      // 「弹窗已经打开、下拉里却没有选项」（另一路数据还没回来）。
-      const [list, ups] = await Promise.all([keyApi.list(), upstreamsApi.list()]);
-      setKeys(list);
-      setUpstreams(ups.items || []);
-      return true;
-    } catch (e) {
-      notify.err(errText(e));
-      return false;
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
   // 提示出现时确保它在可视区内（见 unknownRef 的说明）
   useEffect(() => {
     if (unknownModels && unknownModels.length) {
@@ -200,8 +204,10 @@ export default function KeysPage() {
     }
   }, [unknownModels]);
 
-  // 密钥状态可能被下游调用改变（配额用尽、过期），心跳刷新保持同步
-  useHeartbeat(load, 60000);
+  // 密钥状态可能被下游调用改变（配额用尽、过期），心跳刷新保持同步。
+  // 走 reload（刷新模式）：只把新数据换上去，**不**重走首屏流程——否则骨架会每
+  // 60 秒闪一次。
+  useHeartbeat(reload, 60000);
 
   /** 列表里显示上游名；找不到（刚被删）时退回 #id —— 不显示空白。 */
   function upstreamName(id: number): string {
@@ -293,10 +299,10 @@ export default function KeysPage() {
       }
       setFormOpen(false);
       // 刷新失败**不能**把这次创建判成失败：密钥已经建好了。
-      // 所以这里用 load() 的返回值判断，而不是 `.catch()` —— load 内部已经
-      // 把异常吃掉并弹了通用错误提示，返回的 Promise 永远不 reject，
+      // 所以这里用 reload() 的返回值判断，而不是 `.catch()` —— reload 内部已经
+      // 把异常收进 errors 并返回布尔值，返回的 Promise 永远不 reject，
       // 用 .catch 的话这段提示永远不会出现，用户只会看到「失败了」。
-      if (!(await load())) {
+      if (!(await reload())) {
         notify.warn(t('keys.createdButRefreshFailed'), t('keys.createdButRefreshFailedHint'));
       }
     } catch (e) {
@@ -311,7 +317,7 @@ export default function KeysPage() {
     try {
       await keyApi.update(k.id, {enabled: !k.enabled});
       notify.ok(k.enabled ? t('keys.disabled') : t('keys.enabled'));
-      load();
+      reload();
     } catch (e) {
       notify.err(errText(e));
     }
@@ -485,21 +491,8 @@ export default function KeysPage() {
   const packetKeys = keys.filter((k) => k.packet_id);
   const shownKeys = tab === 'packet' ? packetKeys : normalKeys;
 
-  return (
-    <div className="flex flex-col gap-4 md:gap-6">
-      {/* 分组：红包一次生成一批、额度零碎，与手工建的混在一起很难看。
-          数字直接标在 tab 上，不用切过去才知道另一边有多少个。 */}
-      <Tabs value={tab} onValueChange={(v) => setTab(v as 'normal' | 'packet')}>
-        <TabsList className="rounded-full">
-          <TabsTrigger value="normal" className="rounded-full">
-            {t('keys.tabNormal')} · {normalKeys.length}
-          </TabsTrigger>
-          <TabsTrigger value="packet" className="rounded-full">
-            {t('keys.tabPacket')} · {packetKeys.length}
-          </TabsTrigger>
-        </TabsList>
-      </Tabs>
-
+  const header = (
+    <>
       <PageHeader
         title={t('keys.title')}
         description={t('keys.description')}
@@ -514,6 +507,59 @@ export default function KeysPage() {
           </>
         }
       />
+      {/* 二级导航（批次 4 ②：本页吸收了「红包」——红包产出的就是密钥，
+          一份一个 key，只是多了「一次建一批、额度随机分配」这层封装）。
+          放进 `header` 而不是两个 return 分支里各写一遍：下面的首屏守卫
+          是**早返回**，漏一处就会出现「取不到密钥时 Tab 不见了」。 */}
+      <PageSectionTabs />
+    </>
+  );
+
+  // 首屏：一次都没取到。
+  //
+  // 为什么必须在这里拦住、而不是让下面的空状态兜住：**取不到密钥 ≠ 没有密钥。**
+  // 原先的做法是取数失败只弹一条几秒后消失的提示，然后 `keys` 仍是 `[]`、`loading`
+  // 已经变回 false —— 于是页面显示出「暂无密钥」和一个「新建密钥」按钮。密钥是**凭据**，
+  // 用户看到这四个字的反应是「我的密钥被删了 / 我没建过」，而事实是**不知道有没有**；
+  // 更糟的是他会顺着那个按钮重建 —— 于是建出重复密钥，**正好绕过 9-16 那次为
+  // 「创建成功但刷新失败」加的防线**（那条防的是写之后，这条是打开页面时）。
+  if (isInitialFailed || isInitialLoading) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6">
+        {header}
+        {isInitialFailed ? <LoadError variant="page" onRetry={reload} /> : <KeysSkeleton />}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
+
+      {/* 刷新时有请求失败：常驻提示，**不**顶掉已经显示出来的内容——那些数据仍然
+          是对的，只是可能不是最新的。 */}
+      {partialFailed && (
+        <LoadError message={t('state.partialFailed')} onRetry={reload} />
+      )}
+
+      {/* 分组：红包一次生成一批、额度零碎，与手工建的混在一起很难看。
+          数字直接标在 tab 上，不用切过去才知道另一边有多少个。
+          ⚠️ 列表没取到时这两个数字要**一起收起来**：`keys` 为空时它会写成
+          「普通密钥 · 0」，那是和「暂无 API 密钥」同一句谎话的另一半（任务记录页
+          的「共 0 条」是同一处，PR #97 才补上）。判据同样用 `keysFailed`
+          ——「这一份失败没」，上游列表挂掉时这两个 0 是如实的。 */}
+      <Tabs value={tab} onValueChange={(v) => setTab(v as 'normal' | 'packet')}>
+        <TabsList className="rounded-full">
+          <TabsTrigger value="normal" className="rounded-full">
+            {t('keys.tabNormal')}
+            {!keysFailed && <> · {normalKeys.length}</>}
+          </TabsTrigger>
+          <TabsTrigger value="packet" className="rounded-full">
+            {t('keys.tabPacket')}
+            {!keysFailed && <> · {packetKeys.length}</>}
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
 
       <section className="overflow-hidden rounded-[20px] bg-muted">
         <Table>
@@ -660,7 +706,7 @@ export default function KeysPage() {
                           onConfirm={async () => {
                             await keyApi.resetUsage(k.id);
                             notify.ok(t('keys.resetDone'));
-                            load();
+                            reload();
                           }}
                           trigger={
                             <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('keys.resetUsage')}>
@@ -668,15 +714,18 @@ export default function KeysPage() {
                             </Button>
                           }
                         />
+                        {/* 与账号页删除弹窗同一处理：密钥名可能很长，放 18px 标题里一折行就挤乱，
+                            改放说明里，标题固定一行。窄屏用 min() 保住两侧 1rem 留白。 */}
                         <ConfirmDialog
-                          title={t('keys.deleteTitle', {name: k.name})}
-                          description={t('keys.deleteDesc')}
+                          title={t('keys.deleteTitle')}
+                          description={t('keys.deleteDesc', {name: k.name})}
+                          contentClassName="max-w-[min(380px,calc(100%-2rem))] sm:max-w-[380px]"
                           confirmText={t('keys.delete')}
                           destructive
                           onConfirm={async () => {
                             await keyApi.remove(k.id);
                             notify.ok(t('keys.deleted'));
-                            load();
+                            reload();
                           }}
                           trigger={
                             <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md text-red-500 hover:text-red-600" title={t('keys.delete')}>
@@ -693,7 +742,10 @@ export default function KeysPage() {
           </TableBody>
         </Table>
 
-        {!keys.length && !loading && (
+        {/* 「暂无密钥」是**一条都没有**的断言，取不到时不能说这句（见上面首屏守卫的
+            说明）。`keysFailed` 覆盖「另一份取到了、这一份没有」的部分失败：那时首屏
+            守卫不会拦（values 里还有 upstreams），但列表这一块同样不知道有没有。 */}
+        {!keys.length && !keysFailed && (
           <EmptyState
             icon={KeyRound}
             title={t('keys.emptyTitle')}
@@ -1117,5 +1169,28 @@ export default function KeysPage() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * 首屏骨架。结构与真实内容**逐块对应**（分组 tab / 表格块 + 若干行），而不是一坨
+ * 居中的转圈：数据到位时版面不会整体跳一下。
+ *
+ * 页面每 60 秒心跳刷新一次，但只有「一份都没取到」才会走到这里
+ * （见 use-async-data 的 isInitialLoading），所以不会一闪一闪。
+ */
+function KeysSkeleton() {
+  return (
+    <>
+      <SkeletonBar className="h-9 w-52 rounded-full" />
+      <section className="overflow-hidden rounded-[20px] bg-muted p-4">
+        <SkeletonBar className="mb-4 h-4 w-28" />
+        <div className="space-y-3">
+          {Array.from({length: 5}, (_, i) => (
+            <SkeletonBar key={i} className="h-11 w-full rounded-xl" />
+          ))}
+        </div>
+      </section>
+    </>
   );
 }

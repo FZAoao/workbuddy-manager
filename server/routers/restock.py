@@ -226,6 +226,8 @@ async def public_restock_auth_poll(body: OAuthPollIn, request: Request) -> dict:
                 registered, _ = await tencent.submit_region(auth_probe, session['region'])
                 if not registered:
                     raise HTTPException(status_code=502, detail='国际版地区注册失败，请稍后重试')
+            # 与后台登录一致：注册后尝试领取一次性 trial（接口幂等，失败不阻断落盘）。
+            await tencent.claim_trial(auth_probe)
 
         ip = client_ip(request)
         try:

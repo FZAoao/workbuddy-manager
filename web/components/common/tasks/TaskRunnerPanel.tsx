@@ -8,6 +8,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/animate-ui/radix/dialog';
@@ -218,7 +219,7 @@ export function TaskRunnerPanel() {
               <RichText text={t('tasks.runFullConfirmBody')} />
             </DialogDescription>
           </DialogHeader>
-          <div className="mt-2 flex justify-end gap-2">
+          <DialogFooter>
             <Button variant="ghost" size="sm" className="rounded-full"
                     onClick={() => setConfirmFull(false)}>
               {t('common.cancel')}
@@ -231,7 +232,7 @@ export function TaskRunnerPanel() {
                     }}>
               {t('tasks.runFullConfirmOk')}
             </Button>
-          </div>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

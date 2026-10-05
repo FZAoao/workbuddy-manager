@@ -5,3 +5,8 @@ pydantic>=2.7.0
 # 在线导入账号（POST /api/accounts/import）用 multipart 上传：FastAPI 的
 # File()/UploadFile 依赖它解析表单，缺失时该端点会直接报 500。
 python-multipart>=0.0.9
+# PostgreSQL 异地备份的驱动（见 services/pgsync）。装成 [binary] 是为了拿到
+# 预编译的 libpq —— 纯 Python 版要求目标机上已有 libpq，而面板的部署环境
+# （容器 / systemd / Windows 原生）不保证有。用不到这个功能的部署不受影响：
+# 驱动是**按需导入**的，没装也能正常启动，只是备份页会提示去装。
+psycopg[binary]>=3.1

@@ -37,10 +37,12 @@ from .realm import (
     supports_checkin,
 )
 
+from .errtext import err_text
+
 # 扫码 state 缓存：state -> (登记时间, 发起时的版本)。
 # 记 realm 是为了在回调时校验一致——若用户先开国内版的码、又切到国际版再轮询，
 # 不校验就会把国际版的 token 写进国内版的会话流程（上游 validateRealmMatch 同此意图）。
-_state_cache: dict[str, tuple[float, Realm]] = {}
+_state_cache: dict[str, tuple[float, Realm] | tuple[float, Realm, str]] = {}
 # 在线 JSON 导入可能被多个请求并发调用。默认禁止覆盖时，存在性检查与落盘
 # 必须在同一临界区内，否则两个同 UID 请求都可能先看到“不存在”再互相覆盖。
 _import_write_lock = threading.Lock()
@@ -102,9 +104,16 @@ def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
     return billing_headers(realm, auth)
 
 
-async def start_login(realm: Realm = CN) -> dict:
+def _account_http_client(auth: dict):
+    proxy = config.account_proxy(auth)
+    if proxy is None:
+        return config.http_client(config.TENCENT_TIMEOUT, connect=5)
+    return config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy)
+
+
+async def start_login(realm: Realm = CN, proxy_name: str = '') -> dict:
     """发起扫码登录。realm 决定用哪套端点与 Origin（默认国内版）。"""
-    async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+    async with _account_http_client({'proxy': proxy_name}) as client:
         resp = await client.post(
             f'{chat_base(realm)}/v2/plugin/auth/state',
             params={'platform': 'CLI'},
@@ -116,8 +125,8 @@ async def start_login(realm: Realm = CN) -> dict:
         raise RuntimeError(f'获取授权链接失败 code={code}')
     state = data.get('state') or ''
     if state:
-        _state_cache[state] = (time.time(), realm)
-    return {'state': state, 'authUrl': data.get('authUrl') or '', 'realm': realm}
+        _state_cache[state] = (time.time(), realm, proxy_name)
+    return {'state': state, 'authUrl': data.get('authUrl') or '', 'realm': realm, 'proxy': proxy_name}
 
 
 def is_pending(state: str) -> bool:
@@ -144,7 +153,8 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
     entry = _state_cache.get(state)
     if entry is None:
         return {'status': 'invalid'}
-    created, reg_realm = entry
+    created, reg_realm = entry[:2]
+    proxy_name = entry[2] if len(entry) > 2 else ''
     if time.time() - created > STATE_TTL:
         drop_state(state)
         return {'status': 'expired'}
@@ -153,7 +163,7 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
         return {'status': 'realm_mismatch', 'expected': reg_realm, 'got': realm}
     realm = reg_realm
 
-    async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+    async with _account_http_client({'proxy': proxy_name}) as client:
         resp = await client.get(
             f'{chat_base(realm)}/v2/plugin/auth/token',
             params={'state': state},
@@ -201,6 +211,7 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
         'expires_at': int(time.time()) + expires_in,
         'domain': domain,
         'realm': realm,
+        'proxy': proxy_name,
     }
 
 
@@ -235,12 +246,17 @@ def _atomic_write_json(target: Path, payload: dict) -> None:
     为什么不照抄上游 SaveAtomic 的 0o600：上游是「同一个进程既写又读」，
     0600 自洽；我们是跨 uid 写读，前提不同。
     """
+    original = target.stat() if target.exists() else None
     fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp',
                                     dir=str(target.parent))
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, indent=1))
-        os.chmod(tmp_name, 0o644)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if original is not None and hasattr(os, 'chown'):
+            os.chown(tmp_name, original.st_uid, original.st_gid)
+        os.chmod(tmp_name, (original.st_mode & 0o777) if original is not None else 0o644)
         os.replace(tmp_name, target)
     except Exception:
         # 失败时清掉临时文件，避免在 auths 目录里留垃圾（它不会被加载，但会让人困惑）
@@ -273,7 +289,7 @@ def update_auth_tokens(filename: str, fields: dict,
     except FileNotFoundError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'账号文件无法解析，已放弃写入：{exc}') from exc
+        raise ValueError(f'账号文件无法解析，已放弃写入：{err_text(exc)}') from exc
     if not isinstance(raw, dict):
         raise ValueError('账号文件格式异常，已放弃写入')
 
@@ -342,11 +358,13 @@ def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, b
 
     # 保留旧的 device_token（若有）。读失败不影响主流程。
     old_device_token = ''
+    old_proxy = ''
     if existed:
         try:
             old = json.loads(target.read_text(encoding='utf-8'))
             if isinstance(old, dict):
                 old_device_token = str(old.get('device_token') or '')
+                old_proxy = str(old.get('proxy') or '')
         except Exception:  # noqa: BLE001
             old_device_token = ''
 
@@ -366,6 +384,10 @@ def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, b
     }
     if old_device_token:
         payload['device_token'] = old_device_token
+
+    proxy_name = str(account.get('proxy', old_proxy) or '').strip()
+    if proxy_name:
+        payload['proxy'] = proxy_name
 
     # 原子替换的完整理由见 `_atomic_write_json`（热加载读到空文件会误判账号被删）
     _atomic_write_json(target, payload)
@@ -598,10 +620,10 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
 
     url = f'{chat_base(realm)}/v2/plugin/auth/token/refresh'
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth) as client:
             resp = await client.post(url, headers=headers)
     except Exception as exc:  # noqa: BLE001
-        return False, f'刷新异常: {exc}', {}
+        return False, f'刷新异常: {err_text(exc)}', {}
 
     if resp.status_code >= 400:
         # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。
@@ -657,7 +679,7 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
     if not supports_checkin(realm):
         return -2, '国际版无签到体系，已跳过'
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(access_token if isinstance(access_token, dict) else {}) as client:
             resp = await client.post(
                 f'{billing_base(realm)}{billing_paths(realm, "daily-checkin")[0]}',
                 json={},
@@ -670,7 +692,7 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
             return 10001, '今日已签到'
         return code, f'签到返回 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return -1, f'签到异常: {exc}'
+        return -1, f'签到异常: {err_text(exc)}'
 
 
 async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list[dict]]:
@@ -716,7 +738,7 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         # 头走 billing 域（带 X-User-Id 等身份头，对齐上游 BillingHeaders）
         hdr = _billing_hdr(realm, auth)
         resp = None
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth) as client:
             for path in billing_paths(realm, 'user-resource'):
                 resp = await client.post(
                     f'{billing_base(realm)}{path}', json=body, headers=hdr
@@ -749,7 +771,7 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         expiries.sort(key=lambda e: e['at'])
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
-        return False, None, f'查询异常: {exc}', []
+        return False, None, f'查询异常: {err_text(exc)}', []
 
 
 async def fetch_models(auth: dict) -> tuple[bool, list | str]:
@@ -794,7 +816,7 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
         """按候选路径顺序取第一个成功响应，返回 (data, 错误说明)。"""
         last_code = -1
         try:
-            async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+            async with _account_http_client(auth) as client:
                 for path in paths:
                     resp = await client.get(
                         f'{chat_base(realm)}{path}',
@@ -806,7 +828,7 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
                         return body, ''
             return None, f'code={last_code}'
         except Exception as exc:  # noqa: BLE001
-            return None, f'异常: {exc}'
+            return None, f'异常: {err_text(exc)}'
 
     # 两路并发：串行会把模型中心的等待时间翻倍，而两路互不依赖。
     ent_res, v3_res = await asyncio.gather(
@@ -1136,7 +1158,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     # 就是列表、且将来可能再加候选；但**不能**因此以为现在有回落保护 ——
     # 列表只有一个元素时，404/405 会直接走下面的报错分支。
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth) as client:
             for path in chat_paths(realm):
                 async with client.stream(
                     'POST', f'{base}{path}', json=payload, headers=headers,
@@ -1153,7 +1175,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                     return False, '上游未返回任何数据'
         return False, '所有候选路径均不可用'
     except Exception as exc:  # noqa: BLE001
-        return False, f'请求异常: {exc}'
+        return False, f'请求异常: {err_text(exc)}'
 
 
 def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
@@ -1242,7 +1264,7 @@ async def registration_status(auth: dict) -> tuple[bool, str]:
     try:
         # 上游参照实现（scripts/global_region.py activate_region）明确带 X-User-Id，
         # 这里走 billing 域头（含身份头），保持一致
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth) as client:
             resp = await client.get(url, params={'userId': uid}, headers=_billing_hdr(realm, auth))
         code, data = _envelope(resp)
         if code == 200 or code == 0:
@@ -1255,7 +1277,7 @@ async def registration_status(auth: dict) -> tuple[bool, str]:
             return False, '尚未完成地区注册'
         return False, f'注册状态未知 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return False, f'查询注册状态异常: {exc}'
+        return False, f'查询注册状态异常: {err_text(exc)}'
 
 
 async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
@@ -1285,7 +1307,7 @@ async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
     if not token:
         return False, '缺少 accessToken'
 
-    ios2, en_name, numeric = await _region_fields(code_upper)
+    ios2, en_name, numeric = await _region_fields(code_upper, auth)
 
     attrs = {
         'countryCode': [numeric],
@@ -1294,7 +1316,7 @@ async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
     }
     body = {'attributes': attrs}
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth) as client:
             resp = await client.post(
                 f'{billing_base(realm)}/console/login/account',
                 json=body,
@@ -1305,10 +1327,10 @@ async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
             return True, f'地区已提交（{code_upper}）'
         return False, f'提交地区失败 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return False, f'提交地区异常: {exc}'
+        return False, f'提交地区异常: {err_text(exc)}'
 
 
-async def _region_fields(ios2: str) -> tuple[str, str, str]:
+async def _region_fields(ios2: str, auth: dict | None = None) -> tuple[str, str, str]:
     """按 IOS2 短码查该地区的 (IOS2, EnName, Code)。
 
     地区列表来自上游接口 `/billing/area/get-country-code`（响应 data 是内嵌
@@ -1317,7 +1339,7 @@ async def _region_fields(ios2: str) -> tuple[str, str, str]:
     """
     fallback = (ios2, ios2, ios2)
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth or {}) as client:
             resp = await client.post(
                 f'{billing_base(GLOBAL)}/billing/area/get-country-code',
                 json={'filterForbidden': 1},
@@ -1356,7 +1378,7 @@ async def claim_trial(auth: dict) -> tuple[bool, str]:
     if not token:
         return False, '缺少 accessToken'
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with _account_http_client(auth) as client:
             resp = await client.post(
                 f'{billing_base(realm)}/billing/ide/trial',
                 json={},
@@ -1369,4 +1391,4 @@ async def claim_trial(auth: dict) -> tuple[bool, str]:
             return True, 'trial 此前已领取（幂等）'
         return False, f'领取 trial 失败 code={code}'
     except Exception as exc:  # noqa: BLE001
-        return False, f'领取 trial 异常: {exc}'
+        return False, f'领取 trial 异常: {err_text(exc)}'

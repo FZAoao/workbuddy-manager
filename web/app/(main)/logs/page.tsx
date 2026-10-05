@@ -1,11 +1,12 @@
 'use client';
 
 import {useCallback, useRef, useState} from 'react';
-import {ScrollText, Search, Trash2, ChevronLeft, ChevronRight} from 'lucide-react';
+import {ScrollText, RotateCcw, Trash2, ChevronLeft, ChevronRight} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
 import {keyApi, logApi} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
+import {useDebounced} from '@/lib/use-debounce';
 import type {ApiKey, RequestLog} from '@/lib/types';
 import {fmtCredit, fmtDateTime, fmtDateTimeMarked, fmtLatency, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
@@ -45,6 +46,14 @@ import {
 } from '@/components/ui/table';
 
 const PAGE_SIZE = 20;
+
+/**
+ * 默认时间范围（天）。
+ *
+ * 提成常量是因为有两个地方要用同一个值：「重置筛选」要把天数改回来，还要判断
+ * 「用户有没有改过筛选」（决定那个按钮能不能点）。两处各写一个 `'7'` 迟早会不一致。
+ */
+const DEFAULT_DAYS = '7';
 
 /**
  * 空数组的稳定引用。
@@ -102,10 +111,25 @@ export default function LogsPage() {
   const [detail, setDetail] = useState<RequestLog | null>(null);
 
   const [keyId, setKeyId] = useState('all');
-  const [model, setModel] = useState('');
   const [status, setStatus] = useState('all');
+  const [days, setDays] = useState(DEFAULT_DAYS);
+  /** 文本筛选的**输入值**：绑在输入框上，逐字符更新（打字本身不能卡） */
+  const [model, setModel] = useState('');
   const [ip, setIp] = useState('');
-  const [days, setDays] = useState('7');
+
+  /** 筛选一变就回第 1 页：停在第 5 页上看新筛选的结果，多半是一张空表 */
+  const backToFirstPage = useCallback(() => setPage(1), []);
+
+  /**
+   * 文本筛选的**落定值**（防抖 400ms）。取数与依赖数组都用它，**不用输入值**——
+   * 否则输入 `kimi` 会连发 4 次请求（`k` / `ki` / `kim` / `kimi`）。
+   *
+   * 页码复位挂在 `onSettle` 上，而不是另写一个 `useEffect(() => setPage(1), [modelQ])`：
+   * 落定值与页码必须落在**同一次更新**里，否则会先按「新筛选 + 旧页码」查一次、
+   * 再回第 1 页查第二次。理由见 lib/use-debounce.ts 的注释。
+   */
+  const [modelQ, applyModel] = useDebounced(model, 400, backToFirstPage);
+  const [ipQ, applyIp] = useDebounced(ip, 400, backToFirstPage);
 
   /**
    * 切版本时回到第 1 页。
@@ -132,11 +156,18 @@ export default function LogsPage() {
    *  · `realm` 变了 = 换了一个数据上下文 → **清空重取**。旧版本的日志留在屏幕上、
    *    而标题已经写着另一个版本，比空着更误导。切版本也必须**立即**重取，
    *    不能只等 60 秒心跳——用户点一下没反应会以为功能坏了（实测反馈）。
-   *  · `page` / `days` 变了 = 只是换了个查询范围 → **保留现有内容静默重取**。
-   *    翻页是高频操作，若也清空，每翻一页都会闪一次骨架，看起来像页面在抽搐。
+   *  · 其余（页码 / 天数 / 密钥 / 状态 / 模型 / IP）= 只是换了个查询范围 → **保留现有
+   *    内容静默重取**。翻页是高频操作，若也清空，每翻一页都会闪一次骨架，
+   *    看起来像页面在抽搐。
    *
-   * 其余筛选项（密钥 / 模型 / 状态 / IP）**有意不在依赖里**：它们由「查询」按钮
-   * 显式触发，不该边打字边重查。是否改成自动重取是另一个待定议题，本次不动。
+   * **六个筛选项全部进 `refreshDeps`**（这是本次修掉的自相矛盾）：原先只有
+   * `page` / `days` 在依赖里，另外四个只在点「查询」时生效，于是同一排控件有两种
+   * 脾气——天数改完立刻变，密钥改完要再点一下。而「在第 1 页点筛选没反应」那个
+   * 更早的坑（`setPage(1)` 在页码本来就是 1 时是空操作）当时是靠显式补一次
+   * `reloadLogs()` 绕过去的；现在筛选项本身就是依赖，改哪个都会重取，绕法连同
+   * 那个「查询」按钮一起不需要了。
+   *
+   * 文本类（模型 / IP）进依赖的是**防抖落定值**，不是输入值——见上方 `useDebounced`。
    */
   const {
     values,
@@ -152,15 +183,15 @@ export default function LogsPage() {
           page,
           size: PAGE_SIZE,
           key_id: keyId === 'all' ? undefined : keyId,
-          model: model || undefined,
+          model: modelQ || undefined,
           status: status === 'all' ? undefined : status,
-          ip: ip || undefined,
+          ip: ipQ || undefined,
           days: Number(days) || undefined,
           realm,
         }),
     },
     [realm],
-    [page, days],
+    [page, days, keyId, status, modelQ, ipQ],
   );
 
   /**
@@ -195,13 +226,35 @@ export default function LogsPage() {
   /**
    * 回到第 1 页并重取。
    *
-   * 页码本来就在第 1 页时 `setPage(1)` 是个空操作、依赖没变、不会触发重取，
-   * 所以得显式补一次 `reloadLogs()`——这正是原来「在第 1 页点筛选没反应」的坑。
-   * 页码真的变了就交给上面那组依赖去重取，否则会连打两次请求。
+   * 给「清空日志」用：清完之后要看的是**第 1 页**，而不是刚才停留的那一页。
+   * 页码本来就在第 1 页时 `setPage(1)` 是空操作、依赖没变、不会触发重取，
+   * 所以得显式补一次 `reloadLogs()`；页码真的变了就交给依赖去重取，否则会连打两次。
    */
   function refetchFromFirstPage() {
     if (page === 1) reloadLogs();
     else setPage(1);
+  }
+
+  /** 有没有筛选项不是默认值（决定「重置」按钮能不能点） */
+  const isFiltered =
+    keyId !== 'all' || status !== 'all' || days !== DEFAULT_DAYS || model !== '' || ip !== '';
+
+  /**
+   * 一键重置全部筛选。
+   *
+   * 文本类必须走 `applyXxx('')`（立即落定）而不是只 `setModel('')`：后者要等 400ms
+   * 防抖走完才真正生效，中间会先按「旧的文本筛选 + 新的下拉筛选」查一次，列表闪两下。
+   * 这里所有 setState 都在同一个事件处理器里，React 合批成一次渲染 → 只重取一次。
+   */
+  function resetFilters() {
+    setKeyId('all');
+    setStatus('all');
+    setDays(DEFAULT_DAYS);
+    setModel('');
+    setIp('');
+    applyModel('');
+    applyIp('');
+    setPage(1);
   }
 
   const header = (
@@ -299,15 +352,24 @@ export default function LogsPage() {
           </div>
           <div className="space-y-1.5">
             <Label className="text-[11px] text-muted-foreground">{t('nav.models')}</Label>
+            {/* 文本类防抖 400ms 后自动生效，没有「查询」按钮要按 */}
             <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder={t('common.all')} className="bg-background" />
           </div>
           <div className="space-y-1.5">
             <Label className="text-[11px] text-muted-foreground">{t('logs.filterIp')}</Label>
             <Input value={ip} onChange={(e) => setIp(e.target.value)} placeholder={t('common.all')} className="bg-background" />
           </div>
-          <Button className="rounded-full" onClick={refetchFromFirstPage}>
-            <Search />
-            {t('logs.filter')}
+          {/* 原来这里是「查询」按钮。六个筛选项现在都是改完即生效，那个按钮点了
+              只会把同一份查询再打一次，所以换成「重置」——它才是有用的那个动作。
+              没有筛选时置灰而不是隐藏：隐藏会让这一格塌掉、整排控件左右跳。 */}
+          <Button
+            variant="outline"
+            className="rounded-full"
+            disabled={!isFiltered}
+            onClick={resetFilters}
+          >
+            <RotateCcw />
+            {t('logs.reset')}
           </Button>
         </div>
       </section>
@@ -473,7 +535,9 @@ export default function LogsPage() {
               {([
                 ['ip', t('logs.rowIp'), detail.ip],
                 ['key', t('logs.rowKey'), detail.key_name || '—'],
-                ['account', t('logs.rowAccount'), detail.account || t('logs.notCollected')],
+                // 账号来自上游日志回填，可能比请求本身晚几秒；这里只能说
+                // “尚未采集”，不能写成“非流式请求”——那是在猜原因。
+                ['account', t('logs.rowAccount'), detail.account || t('logs.accountPending')],
                 ['model', t('logs.rowModel'), detail.model || '—'],
                 ['mapped', t('logs.rowMappedModel'), detail.mapped_model || '—'],
                 ['status', t('logs.rowStatus'), String(detail.status)],
@@ -555,7 +619,7 @@ function LogsSkeleton() {
   );
 }
 
-/** 筛选区骨架：五个「标签 + 控件」加一个「查询」按钮，正好填满六列网格 */
+/** 筛选区骨架：五个「标签 + 控件」加一个「重置」按钮，正好填满六列网格 */
 function FilterSkeleton() {
   return (
     <section className="rounded-[20px] bg-muted p-4">
