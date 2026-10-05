@@ -1,6 +1,6 @@
 """公开补货链接的生成、校验与最小权限边界。
 
-补货 Token 只授权一件事：向它绑定的账号池提交账号 JSON。它不是管理 API Token，
+补货 Token 只授权向绑定的账号池通过 OAuth 登录或提交账号 JSON。它不是管理 API Token，
 不能读取账号列表、切换目标池或调用任何其它管理接口。
 """
 from __future__ import annotations
@@ -21,6 +21,13 @@ IP_HITS_PER_MINUTE = 20
 _rate_lock = threading.Lock()
 _token_hits: dict[int, deque[float]] = {}
 _ip_hits: dict[str, deque[float]] = {}
+
+# 腾讯 OAuth state 只在当前进程内有效；这里再绑定补货链接和目标目录，避免
+# 持有另一条链接的人拿 state 轮询，或管理员在扫码期间改目标后写错账号池。
+_oauth_lock = threading.Lock()
+_oauth_states: dict[str, dict] = {}
+OAUTH_STATE_TTL = 900
+OAUTH_POLL_INTERVAL = 1.5
 
 
 class RestockError(Exception):
@@ -171,7 +178,60 @@ def delete_link(link_id: int) -> bool:
     db.execute('DELETE FROM restock_links WHERE id = ?', (link_id,))
     with _rate_lock:
         _token_hits.pop(link_id, None)
+    with _oauth_lock:
+        for state in [s for s, entry in _oauth_states.items() if entry['link_id'] == link_id]:
+            _oauth_states.pop(state, None)
     return True
+
+
+def register_oauth_state(state: str, link: dict, auth_dir: Path, realm: str,
+                         region: str | None) -> None:
+    """只保存关联元数据，绝不缓存腾讯返回的账号凭据。"""
+    if not state:
+        raise RestockError(502, '获取授权链接失败，请稍后重试')
+    now = time.monotonic()
+    with _oauth_lock:
+        for old in [s for s, entry in _oauth_states.items()
+                    if now - entry['created_at'] > OAUTH_STATE_TTL]:
+            _oauth_states.pop(old, None)
+        _oauth_states[state] = {
+            'link_id': int(link['id']),
+            'upstream_id': link['upstream_id'],
+            'auth_dir': str(auth_dir.resolve()),
+            'realm': realm,
+            'region': region,
+            'created_at': now,
+            'last_poll': 0.0,
+            'busy': False,
+        }
+
+
+def begin_oauth_poll(state: str, link: dict, auth_dir: Path) -> dict | None:
+    """校验 state 归属并独占一次轮询；过快或并发轮询返回 None。"""
+    now = time.monotonic()
+    with _oauth_lock:
+        entry = _oauth_states.get(state)
+        if entry is None or now - entry['created_at'] > OAUTH_STATE_TTL:
+            _oauth_states.pop(state, None)
+            raise RestockError(400, '授权会话已失效，请重新获取授权链接')
+        if entry['link_id'] != int(link['id']):
+            raise RestockError(403, '授权会话不属于此补货链接')
+        if (entry['upstream_id'] != link['upstream_id']
+                or entry['auth_dir'] != str(auth_dir.resolve())):
+            raise RestockError(409, '补货目标在授权期间发生变化，请重新登录')
+        if entry['busy'] or now - entry['last_poll'] < OAUTH_POLL_INTERVAL:
+            return None
+        entry['busy'] = True
+        entry['last_poll'] = now
+        return dict(entry)
+
+
+def finish_oauth_poll(state: str, *, done: bool) -> None:
+    with _oauth_lock:
+        if done:
+            _oauth_states.pop(state, None)
+        elif state in _oauth_states:
+            _oauth_states[state]['busy'] = False
 
 
 def resolve(token: object) -> dict:
@@ -197,7 +257,8 @@ def resolve(token: object) -> dict:
     return dict(matched)
 
 
-def reserve_batch(link_id: int, ip: str) -> dict:
+def reserve_batch(link_id: int, ip: str, *, expected_upstream_id: int | None = None,
+                  check_target: bool = False) -> dict:
     """原子占用一次批次，避免并发请求越过 max_batches。"""
     conn = db.connect()
     now = int(time.time())
@@ -211,6 +272,8 @@ def reserve_batch(link_id: int, ip: str) -> dict:
                 raise RestockError(403, '补货链接已停用')
             if row['expires_at'] and int(row['expires_at']) <= now:
                 raise RestockError(410, '补货链接已过期')
+            if check_target and row['upstream_id'] != expected_upstream_id:
+                raise RestockError(409, '补货目标在授权期间发生变化，请重新登录')
             maximum = int(row['max_batches'] or 0)
             used = int(row['used_batches'] or 0)
             if maximum and used >= maximum:
@@ -226,6 +289,14 @@ def reserve_batch(link_id: int, ip: str) -> dict:
         except Exception:
             conn.rollback()
             raise
+
+
+def refund_batch(link_id: int) -> None:
+    """OAuth 已授权但落盘失败时归还预占批次，以便修复目录后重试。"""
+    db.execute(
+        'UPDATE restock_links SET used_batches = MAX(0, used_batches - 1) WHERE id = ?',
+        (link_id,),
+    )
 
 
 def check_rate_limit(link_id: int, ip: str) -> None:

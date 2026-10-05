@@ -26,6 +26,8 @@ import type {
   RestockLink,
   CreatedRestockLink,
   RestockImportResponse,
+  RestockOAuthStart,
+  RestockOAuthPoll,
   KeyExportResult,
   KeyImportDetectResult,
   KeyImportResult,
@@ -511,6 +513,14 @@ export const restockApi = {
       headers: {'X-Restock-Token': token},
     }).then((r) => r.data);
   },
+  startOAuth: (token: string, realm: 'cn' | 'global', region?: string) =>
+    http.post<RestockOAuthStart>('/api/public/restock/auth/start', {realm, region}, {
+      headers: {'X-Restock-Token': token},
+    }).then((r) => r.data),
+  pollOAuth: (token: string, state: string) =>
+    http.post<RestockOAuthPoll>('/api/public/restock/auth/poll', {state}, {
+      headers: {'X-Restock-Token': token},
+    }).then((r) => r.data),
 };
 
 export type RestockLinkWrite = {

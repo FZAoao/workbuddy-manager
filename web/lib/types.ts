@@ -1195,6 +1195,20 @@ export interface CreatedRestockLink extends RestockLink {
 
 export type RestockImportResponse = ImportResponse;
 
+export interface RestockOAuthStart {
+  state: string;
+  authUrl: string;
+  realm: 'cn' | 'global';
+}
+
+export interface RestockOAuthPoll {
+  status: 'waiting' | 'success' | 'expired' | 'invalid';
+  uid?: string;
+  nickname?: string;
+  realm?: 'cn' | 'global';
+  updated?: boolean;
+}
+
 /* ── 开学季抽奖中奖记录 ──────────────────────────────── */
 
 /** 奖品类型：credit 积分 / voucher 实物券 / other 未知奖码 */

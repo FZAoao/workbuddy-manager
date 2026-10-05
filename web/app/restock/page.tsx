@@ -14,6 +14,7 @@ import {
   FileJson2,
   Loader2,
   PackagePlus,
+  ScanLine,
   ShieldCheck,
   Trash2,
   UploadCloud,
@@ -25,6 +26,7 @@ import {useI18n} from '@/lib/i18n/provider';
 import {notify} from '@/lib/toast';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
+import {RestockOAuth} from '@/components/common/accounts/RestockOAuth';
 
 const TOKEN_STORE = 'wb-restock-token';
 const FALLBACK_MAX_FILES = 200;
@@ -51,6 +53,7 @@ export default function RestockPage() {
   const [results, setResults] = useState<ImportResult[] | null>(null);
   const [importing, setImporting] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [mode, setMode] = useState<'oauth' | 'json'>('oauth');
 
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -186,6 +189,18 @@ export default function RestockPage() {
     }
   }, [files, t, token]);
 
+  const onOAuthSuccess = useCallback(() => {
+    setInfo((current) => current && current.remaining_batches !== null
+      ? {...current, remaining_batches: Math.max(0, current.remaining_batches - 1)}
+      : current);
+  }, []);
+
+  const onOAuthLinkError = useCallback((status: number) => {
+    if (status === 401) setLinkError(t('restock.invalidLink'));
+    else if (status === 410) setLinkError(t('restock.expiredLink'));
+    else if (status === 403) setLinkError(t('restock.disabledOrExhausted'));
+  }, [t]);
+
   const succeeded = results?.filter((item) => item.ok).length ?? 0;
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
 
@@ -250,7 +265,23 @@ export default function RestockPage() {
               </div>
             </section>
 
-            <section className="rounded-[24px] bg-muted p-4">
+            <div className="flex gap-1 rounded-full bg-muted p-1">
+              {(['oauth', 'json'] as const).map((value) => (
+                <button key={value} type="button" onClick={() => setMode(value)}
+                  className={'flex flex-1 items-center justify-center gap-2 rounded-full px-3 py-2 text-xs transition-colors ' +
+                    (mode === value ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground')}>
+                  {value === 'oauth' ? <ScanLine className="h-4 w-4" /> : <FileJson2 className="h-4 w-4" />}
+                  {t(value === 'oauth' ? 'restock.oauthTab' : 'restock.jsonTab')}
+                </button>
+              ))}
+            </div>
+
+            <div className={mode === 'oauth' ? '' : 'hidden'}>
+              <RestockOAuth token={token} disabled={info.remaining_batches === 0}
+                onSuccess={onOAuthSuccess} onLinkError={onOAuthLinkError} />
+            </div>
+
+            {mode === 'json' && <section className="rounded-[24px] bg-muted p-4">
               <div
                 role="button"
                 tabIndex={0}
@@ -380,7 +411,7 @@ export default function RestockPage() {
                 {importing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <UploadCloud className="mr-2 h-4 w-4" />}
                 {importing ? t('restock.importing') : t('restock.importButton', {count: files.length})}
               </Button>
-            </section>
+            </section>}
           </div>
         )}
       </div>

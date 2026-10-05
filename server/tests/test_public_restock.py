@@ -74,6 +74,7 @@ class PublicRestockTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.client.close()
+        restocksvc._oauth_states.clear()
         if db._conn is not None:
             db._conn.close()
         db._conn = None
@@ -368,6 +369,126 @@ class PublicRestockTest(unittest.TestCase):
             self.assertNotIn(value, logs)
         self.assertNotIn(uid, logs)
         self.assertIn(uid[:8], logs)
+
+    def _oauth_start(self, token: str, **body):
+        with mock.patch.object(tencent, 'start_login', return_value={
+            'state': 'public-state', 'authUrl': 'https://example.com/auth',
+        }):
+            return self.client.post('/api/public/restock/auth/start',
+                                    json=body, headers=self._headers(token))
+
+    def _oauth_poll(self, token: str, state: str = 'public-state'):
+        return self.client.post('/api/public/restock/auth/poll',
+                                json={'state': state}, headers=self._headers(token))
+
+    def test_oauth_requires_token_and_binds_state_to_link(self) -> None:
+        self.assertEqual(self._oauth_start('').status_code, 401)
+        a, b = self._mint(), self._mint()
+        self.assertEqual(self._oauth_start(a['token']).status_code, 200)
+        with mock.patch.object(tencent, 'poll_login') as poll:
+            self.assertEqual(self._oauth_poll(b['token']).status_code, 403)
+            self.assertEqual(self._oauth_poll(a['token'], 'admin-state').status_code, 400)
+            poll.assert_not_called()
+        self.assertEqual(self.client.get('/api/accounts',
+                         headers=self._headers(a['token'])).status_code, 401)
+
+    def test_oauth_success_targets_bound_pool_and_redacts_credentials(self) -> None:
+        target = Path(self._tmp.name) / 'oauth-pool'
+        group = upstreamsvc.create_upstream('OAuth pool', 'http://127.0.0.1:7991',
+                                             auth_dir=str(target))
+        link = self._mint(upstream_id=group['id'], max_batches=1)
+        started = self._oauth_start(link['token'], upstream_id=0)
+        self.assertEqual(started.status_code, 200, started.text)
+        ready = {'status': 'ready', **tencent.parse_auth_json(_account('oauth-secret-uid'))}
+        with mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(reload, 'request_reload_or_restart') as reloader:
+            response = self._oauth_poll(link['token'])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['status'], 'success')
+        self.assertTrue((target / 'workbuddy-oauth-secret-uid.json').exists())
+        self.assertFalse(list(config.AUTH_DIR.glob('*.json')))
+        self.assertEqual(reloader.call_args.kwargs['upstream']['id'], group['id'])
+        for secret in ('AT-oauth-secret-uid', 'RT-oauth-secret-uid', str(target)):
+            self.assertNotIn(secret, response.text)
+            self.assertNotIn(secret, json.dumps(db.list_audit_logs(20)))
+        self.assertNotIn('oauth-secret-uid', json.dumps(db.list_audit_logs(20)))
+        self.assertEqual(restocksvc.list_links()[0]['used_batches'], 1)
+        self.assertEqual(self._oauth_poll(link['token']).status_code, 403)
+
+    def test_oauth_rechecks_revocation_and_target_after_authorization(self) -> None:
+        link = self._mint()
+        self._oauth_start(link['token'])
+        group = upstreamsvc.create_upstream('Other', 'http://127.0.0.1:7991',
+                                             auth_dir=str(Path(self._tmp.name) / 'other'))
+        restocksvc.update_link(link['id'], {'upstream_id': group['id']})
+        with mock.patch.object(tencent, 'poll_login') as poll:
+            self.assertEqual(self._oauth_poll(link['token']).status_code, 409)
+            poll.assert_not_called()
+        restocksvc.update_link(link['id'], {'upstream_id': None})
+        ready = {'status': 'ready', **tencent.parse_auth_json(_account('revoked-oauth'))}
+        async def revoke(*args):
+            restocksvc.update_link(link['id'], {'enabled': False})
+            return ready
+        with mock.patch.object(tencent, 'poll_login', side_effect=revoke):
+            self.assertEqual(self._oauth_poll(link['token']).status_code, 403)
+        self.assertFalse(list(config.AUTH_DIR.glob('*.json')))
+
+    def test_oauth_failed_write_refunds_quota_and_allows_same_state_retry(self) -> None:
+        link = self._mint(max_batches=1)
+        self._oauth_start(link['token'])
+        ready = {'status': 'ready', **tencent.parse_auth_json(_account('retry-oauth'))}
+        with mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(tencent, 'write_imported_auth', side_effect=PermissionError('/secret/path')):
+            response = self._oauth_poll(link['token'])
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn('/secret/path', response.text)
+        self.assertEqual(restocksvc.list_links()[0]['used_batches'], 0)
+        with mock.patch.object(restocksvc, 'OAUTH_POLL_INTERVAL', 0), \
+             mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(reload, 'request_reload_or_restart'):
+            self.assertEqual(self._oauth_poll(link['token']).json()['status'], 'success')
+        self.assertEqual(restocksvc.list_links()[0]['used_batches'], 1)
+
+    def test_oauth_does_not_overwrite_disabled_account(self) -> None:
+        link = self._mint()
+        ready = {'status': 'ready', **tencent.parse_auth_json(_account('duplicate-oauth'))}
+        path = config.AUTH_DIR / 'workbuddy-duplicate-oauth.json.disabled'
+        path.write_text('existing')
+        self._oauth_start(link['token'])
+        with mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(reload, 'request_reload_or_restart') as reloader:
+            response = self._oauth_poll(link['token'])
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(path.read_text(), 'existing')
+        self.assertFalse(list(config.AUTH_DIR.glob('*.json')))
+        self.assertEqual(restocksvc.list_links()[0]['used_batches'], 0)
+        reloader.assert_not_called()
+
+    def test_oauth_global_requires_region_and_registers_before_write(self) -> None:
+        link = self._mint()
+        self.assertEqual(self._oauth_start(link['token'], realm='global').status_code, 400)
+        self.assertEqual(self._oauth_start(link['token'], realm='global', region='HK').status_code, 200)
+        ready = {'status': 'ready', **tencent.parse_auth_json(_account('global-oauth')),
+                 'realm': 'global', 'domain': 'www.workbuddy.ai'}
+        with mock.patch.object(tencent, 'poll_login', return_value=ready) as poll, \
+             mock.patch.object(tencent, 'registration_status', return_value=(False, '')) , \
+             mock.patch.object(tencent, 'submit_region', return_value=(True, '')) as register, \
+             mock.patch.object(reload, 'request_reload_or_restart'):
+            response = self._oauth_poll(link['token'])
+        self.assertEqual(response.json()['status'], 'success', response.text)
+        poll.assert_awaited_once_with('public-state', 'global')
+        self.assertEqual(register.call_args.args[1], 'HK')
+        saved = json.loads((config.AUTH_DIR / 'workbuddy-global-oauth.json').read_text())
+        self.assertEqual(saved['auth']['realm'], 'global')
+
+    def test_oauth_waiting_does_not_consume_quota_and_throttles_polls(self) -> None:
+        link = self._mint(max_batches=1)
+        self._oauth_start(link['token'])
+        with mock.patch.object(tencent, 'poll_login', return_value={'status': 'waiting'}) as poll:
+            self.assertEqual(self._oauth_poll(link['token']).json()['status'], 'waiting')
+            self.assertEqual(self._oauth_poll(link['token']).json()['status'], 'waiting')
+            poll.assert_awaited_once()
+        self.assertEqual(restocksvc.list_links()[0]['used_batches'], 0)
 
     def test_admin_crud_requires_session_and_token_is_only_returned_once(self) -> None:
         self.assertEqual(self.client.get('/api/restock-links').status_code, 401)
