@@ -685,7 +685,7 @@ Full deployment notes (Nginx config, hardening, FAQ) are in [deploy/README.md](d
 | `WB_ADMIN_PASSWORD` | random | Initial admin password |
 | `WB_SECURE_COOKIE` | `auto` | Decided from `X-Forwarded-Proto` |
 | `WB_GATEWAY_RATE_PER_MIN` | `120` | Outbound gateway per-key limit: admitted requests per 60s (`0` = unlimited) |
-| `WB_GATEWAY_MAX_BODY_MB` | `32` | Outbound gateway request body limit (MB) |
+| `WB_GATEWAY_MAX_BODY_MB` | `32` | Outbound gateway JSON body limit (MB); base64 images increase request size |
 | `WB_SYNC_DEPLOY` | `1` | Update `deploy/` together with the manager (`0` = leave it untouched) |
 | `WB_HTTP_PROXY` | empty | Outbound proxy; empty means direct |
 
@@ -904,7 +904,7 @@ workbuddy-manager/
   so a leaked token cannot escalate privileges or persist itself
   (see [docs/api-tokens.md](docs/api-tokens.md))
 - `/docs` and `/openapi.json` are disabled in production (`WB_ENABLE_DOCS=1` to enable)
-- The gateway limits request body size (8 MiB) and per-key request rate (120/min by default)
+- The gateway limits request body size (32 MiB by default, configurable with `WB_GATEWAY_MAX_BODY_MB`) and per-key request rate (120/min by default)
 - Security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`, …) are set
 - `users.json`, `data/*.db`, `.env` and account auth files are all excluded via `.gitignore`
 

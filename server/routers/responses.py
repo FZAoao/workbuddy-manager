@@ -274,12 +274,18 @@ def _text_of_parts(content: object) -> tuple[str, list[dict]]:
                 texts.append(text)
                 blocks.append({'type': 'text', 'text': text})
         elif kind in ('input_image', 'image_url'):
-            url = part.get('image_url') or part.get('url')
+            image = part.get('image_url')
+            url = image or part.get('url')
+            detail = part.get('detail')
             # Responses 允许 image_url 是字符串或 {url: ...}
             if isinstance(url, dict):
+                detail = url.get('detail', detail)
                 url = url.get('url')
             if isinstance(url, str) and url:
-                blocks.append({'type': 'image_url', 'image_url': {'url': url}})
+                image_url = {'url': url}
+                if detail in ('auto', 'low', 'high'):
+                    image_url['detail'] = detail
+                blocks.append({'type': 'image_url', 'image_url': image_url})
     return '\n'.join(texts), blocks
 
 

@@ -171,7 +171,7 @@ server {
     ssl_certificate     /path/fullchain.pem;
     ssl_certificate_key /path/privkey.pem;
 
-    client_max_body_size 16m;   # 需大于管理端 8 MiB 的网关请求体上限
+    client_max_body_size 64m;   # 高于网关默认 32 MiB，为图片 Base64 编码留出余量
 
     location / {
         proxy_pass http://127.0.0.1:7864;

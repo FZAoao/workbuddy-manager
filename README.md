@@ -596,7 +596,7 @@ journalctl -u workbuddy-web | grep -A3 '初始管理员'
 | `WB_SESSION_DAYS` | `1` | 会话**总时长**上限（天），到点必须重新登录 |
 | `WB_SESSION_IDLE_HOURS` | `12` | 会话**空闲**上限（小时）：多久没操作就失效（滑动续期窗口） |
 | `WB_GATEWAY_RATE_PER_MIN` | `120` | 对外网关**每密钥**限流：60 秒内放行的请求数上限（`0` = 不限制） |
-| `WB_GATEWAY_MAX_BODY_MB` | `32` | 对外网关的请求体上限（MB） |
+| `WB_GATEWAY_MAX_BODY_MB` | `32` | 对外网关 JSON 请求体上限（MB）；图片 Base64 会增大请求体 |
 | `WB_SYNC_DEPLOY` | `1` | 更新管理端时是否让 `deploy/` 一起更新（`0` = 保持本地不动） |
 | `WB_HTTP_PROXY` | 空 | 出口代理，留空 = 全部直连 |
 
@@ -813,7 +813,7 @@ workbuddy-manager/
   全程审计），供脚本 / CI 免登录调用；**高危接口与令牌管理本身只接受会话登录**，
   令牌泄露也无法提权或自助持久化（见 [docs/api-tokens.md](docs/api-tokens.md)）
 - 生产环境默认关闭 `/docs`、`/openapi.json`（`WB_ENABLE_DOCS=1` 开启）
-- 网关限制请求体大小（8 MiB）与每密钥调用频率（默认 120 次/分钟）
+- 网关限制请求体大小（默认 32 MiB，可通过 `WB_GATEWAY_MAX_BODY_MB` 调整）与每密钥调用频率（默认 120 次/分钟）
 - 已配置 CSP、`X-Frame-Options`、`X-Content-Type-Options` 等安全响应头
 - `users.json`、`data/*.db`、`.env`、账号授权文件均已在 `.gitignore` 中排除
 

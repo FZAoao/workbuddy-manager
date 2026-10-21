@@ -165,6 +165,19 @@ class ToolOutputImageTest(unittest.TestCase):
         img_msg = next(m for m in out['messages'] if m['role'] == 'user')
         self.assertEqual(img_msg['content'][0]['image_url']['url'], 'https://x/y.png')
 
+    def test_image_detail_is_preserved(self) -> None:
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'role': 'user', 'content': [
+                {'type': 'input_image', 'image_url': 'https://x/y.png', 'detail': 'high'},
+                {'type': 'input_image', 'image_url': {
+                    'url': 'data:image/jpeg;base64,QUJD', 'detail': 'low'}},
+            ]},
+        ]})
+        blocks = out['messages'][0]['content']
+        self.assertEqual(blocks[0]['image_url'], {'url': 'https://x/y.png', 'detail': 'high'})
+        self.assertEqual(blocks[1]['image_url'], {
+            'url': 'data:image/jpeg;base64,QUJD', 'detail': 'low'})
+
     def test_image_follows_its_own_tool_message(self) -> None:
         """图片必须紧跟它那次工具调用的 tool 消息（顺序即归属）。"""
         out = R.to_chat_request({'model': 'm', 'input': [

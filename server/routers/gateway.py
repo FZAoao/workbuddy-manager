@@ -56,39 +56,18 @@ def _bearer(request: Request) -> str:
 # 所以做法是：上限改成**本端自己的**配置（`WB_GATEWAY_MAX_BODY_MB`），默认调到
 # 32 MB —— 足够容纳常见的长上下文与附件，又不会让单进程内存失控。
 #
-# 兼容：上游若仍是**旧版**（配置里还有 server.max_body_mb），继续尊重它的取值
-# （见 max_body_bytes），这样升级顺序不受限：先升哪边都不会出现「一边说 256MB
-# 另一边 413」的错配。
-_BODY_LIMIT_TTL = 10
-_body_limit_cache: dict[str, float | int] = {'at': 0.0, 'bytes': 0}
+# 不读取上游旧版 config.json 中的 server.max_body_mb：它是上游自身的历史设置，
+# 且新版上游已移除对应限制；继续沿用会让旧配置悄悄盖过网关自己的明确上限。
 DEFAULT_MAX_BODY_MB = _env_int('WB_GATEWAY_MAX_BODY_MB', 32)
 
 
 def max_body_bytes() -> int:
     """当前生效的请求体上限（字节）。
 
-    取值顺序：
-      1. 上游 config.json 的 `server.max_body_mb`（**仅旧版上游还有这个键**）；
-      2. 否则用本端默认值（`WB_GATEWAY_MAX_BODY_MB`，默认 32 MB）。
+    只使用网关自己的 `WB_GATEWAY_MAX_BODY_MB`（默认 32 MB）。
 
-    每次读配置有 IO 成本，故做 10 秒缓存：改动很快生效，又不必每请求读文件。
     """
-    now = time.time()
-    cached = int(_body_limit_cache['bytes'])
-    if cached and now - float(_body_limit_cache['at']) < _BODY_LIMIT_TTL:
-        return cached
-    limit = DEFAULT_MAX_BODY_MB * 1024 * 1024
-    try:
-        cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
-        mb = int((cfg.get('server') or {}).get('max_body_mb') or 0)
-        if mb > 0:
-            limit = mb * 1024 * 1024
-    except Exception:  # noqa: BLE001
-        # 配置读不到就沿用默认值：网关不能因为读不到配置而拒绝服务
-        pass
-    _body_limit_cache['at'] = now
-    _body_limit_cache['bytes'] = limit
-    return limit
+    return DEFAULT_MAX_BODY_MB * 1024 * 1024
 
 
 def _payload_too_large(limit: int) -> JSONResponse:

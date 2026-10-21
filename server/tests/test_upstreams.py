@@ -250,7 +250,7 @@ class UpstreamRoutingTest(_TempDbMixin, unittest.TestCase):
                 return False
 
             async def post(self_, url, **kw):
-                sent.append(('POST', url, kw.get('headers') or {}))
+                sent.append(('POST', url, kw.get('headers') or {}, kw.get('json')))
                 return resp
 
             async def get(self_, url, **kw):
@@ -285,6 +285,33 @@ class UpstreamRoutingTest(_TempDbMixin, unittest.TestCase):
                          '必须用该上游的 api_key（拿错 key 等于打到别的账号池）')
         self.assertEqual(sent[1][1], 'http://default.example:7863/v1/chat/completions',
                          '未绑定的密钥走默认上游')
+
+    def test_chat_gateway_preserves_multimodal_image_content(self) -> None:
+        key = keysvc.create_key('images')
+        content = [
+            {'type': 'text', 'text': '比较这两张图片'},
+            {'type': 'image_url', 'image_url': {
+                'url': 'data:image/png;base64,QUJD', 'detail': 'high'}},
+            {'type': 'image_url', 'image_url': {
+                'url': 'https://images.example/photo.jpg', 'detail': 'low'}},
+        ]
+        request_body = {
+            'model': 'glm-5.2',
+            'messages': [{'role': 'user', 'content': content}],
+            'stream': False,
+        }
+        sent: list = []
+        with mock.patch.object(config, 'WB2API_BASE', 'http://default.example:7863'), \
+                mock.patch.object(config, 'http_client', lambda *a, **k: self._fake_client(sent)):
+            response = self.client.post(
+                '/v1/chat/completions',
+                headers={'Authorization': f"Bearer {key['key']}"},
+                json=request_body,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(sent[0][3]['messages'][0]['content'], content,
+                         '模型无关的网关必须完整保留多图、URL、detail 与内容顺序')
 
     def test_disabled_upstream_errors_and_never_calls_default(self) -> None:
         """绑定的上游停用 → 503 且**不许**回落到默认上游（静默回落 = 隔离失效）。"""
