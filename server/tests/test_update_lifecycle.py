@@ -60,22 +60,60 @@ class PidAlive(unittest.TestCase):
 
         Windows 分支刻意**不先 wait**：此时内核对象仍被父进程句柄持有，
         os.kill(pid,0) 版在这里 3/3 假报「存活」（事故根因——锁永不失效，
-        前端永远「执行中」），新实现必须能判死。POSIX 分支 zombie 期
-        os.kill(pid,0) 本就成功（语义正确），等 wait/reap 之后再判死。
+        前端永远「执行中」），新实现必须能判死。POSIX 分支同理：进程退出但
+        未被回收时是 zombie，os.kill(pid,0) 同样静默成功，新实现靠 /proc 判死。
         """
         proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
         try:
             proc.kill()
-            if os.name == 'nt':
-                self.assertFalse(updater._pid_alive(proc.pid))
-                proc.wait()
-            else:
-                proc.wait()
-                self.assertFalse(updater._pid_alive(proc.pid))
+            # 不先 wait：POSIX 下此刻是 zombie，必须判死（旧实现会误报存活）
+            for _ in range(50):
+                if proc.poll() is not None:
+                    break
+                import time as _t
+                _t.sleep(0.02)
+            self.assertFalse(updater._pid_alive(proc.pid))
+            proc.wait()
+            self.assertFalse(updater._pid_alive(proc.pid))
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+    def test_zombie_pid_reports_false_posix(self) -> None:
+        """POSIX 僵尸进程（已退出、未被父进程 reap）必须判死。
+
+        事故场景：更新子进程退出后父进程未及时 wait，update.lock 里记录的 pid
+        变成 zombie。os.kill(pid, 0) 对 zombie 返回成功 → _lock_active() 永远为真
+        → read_status() 把 running 强制拉回 true → 前端永久显示「正在更新」，
+        而状态文件其实早已写入 running=false。
+        """
+        if os.name == 'nt':
+            self.skipTest('POSIX 专用：/proc/<pid>/stat 的 Z 状态')
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        try:
+            proc.terminate()
+            # 等待进入 zombie：进程已退出但父进程尚未 wait
+            deadline = __import__('time').time() + 5
+            while __import__('time').time() < deadline:
+                try:
+                    with open(f'/proc/{proc.pid}/stat', 'rb') as f:
+                        state = f.read().rsplit(b')', 1)[1].split()[0]
+                except (OSError, IndexError):
+                    break
+                if state == b'Z':
+                    break
+                __import__('time').sleep(0.02)
+            else:
+                self.skipTest('进程未能进入 zombie 状态（环境不支持）')
+            self.assertFalse(
+                updater._pid_alive(proc.pid),
+                'zombie 进程必须判死，否则 update.lock 永不失效',
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
     def test_missing_pid_reports_false(self) -> None:
         """从未存在的 pid：Windows 上 OpenProcess 报 87，POSIX 上 ProcessLookupError。"""
@@ -95,14 +133,12 @@ class InitialStatusClosedLoop(unittest.TestCase):
         self._orig = {
             'STATUS_FILE': updater.STATUS_FILE,
             'LOCK_FILE': updater.LOCK_FILE,
-            'UPSTREAM_REF_FILE': updater.UPSTREAM_REF_FILE,
             'current_version': updater.current_version,
             'in_container': updater.in_container,
             'can_control_docker': updater.can_control_docker,
         }
         updater.STATUS_FILE = self.dir / 'update-status.json'
         updater.LOCK_FILE = self.dir / 'update.lock'
-        updater.UPSTREAM_REF_FILE = self.dir / 'upstream-ref.txt'
         self._orig_data = config.DATA_DIR
         config.DATA_DIR = self.dir
         updater.current_version = lambda: 'v1.0.66'  # type: ignore[assignment]
@@ -332,9 +368,6 @@ class ChildStdioEncoding(unittest.TestCase):
             self.assertIn('✓', out.read_text(encoding='utf-8'))
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class RestartStepOnWindows(unittest.TestCase):
     """Windows 原生部署：新代码就位后**不许**去调 systemctl，也不能报失败。
@@ -502,6 +535,28 @@ class UpdateProxyTest(unittest.TestCase):
         mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY='http://panel-proxy:7890')
         self.assertEqual(mod.UPDATE_PROXY, 'http://panel-proxy:7890')
 
+
+    def test_socks5_panel_proxy_is_not_handed_to_the_updater(self) -> None:
+        """面板能吃 socks5，更新器（urllib）吃不了 —— 不能带着它去下载。
+
+        带着它下载只会得到一条看不懂的报错；正确行为是忽略并记一条日志说清怎么办。
+        """
+        mod, _ = self._load(WB_UPDATE_PROXY=None,
+                            WB_HTTP_PROXY='socks5://user:secret@127.0.0.1:1080')
+        self.assertEqual(mod.UPDATE_PROXY, '',
+                         'socks5 被当成 http 代理交给 urllib 了，下载必然失败')
+        self.assertTrue(mod.PROXY_UNSUPPORTED)
+
+    def test_explicit_socks_update_proxy_is_also_ignored(self) -> None:
+        mod, _ = self._load(WB_UPDATE_PROXY='socks5://127.0.0.1:1080', WB_HTTP_PROXY=None)
+        self.assertEqual(mod.UPDATE_PROXY, '')
+        self.assertTrue(mod.PROXY_UNSUPPORTED)
+
+    def test_http_proxy_needs_no_warning(self) -> None:
+        mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY='http://panel-proxy:7890')
+        self.assertEqual(mod.PROXY_UNSUPPORTED, '',
+                         'http 代理被误判成不支持 —— 会平白多一条警告日志')
+
     def test_network_failure_hint_mentions_the_proxy_knob(self) -> None:
         mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY=None)
         hint = mod._download_hint(OSError('The read operation timed out'))
@@ -509,3 +564,6 @@ class UpdateProxyTest(unittest.TestCase):
                       '下载失败时没有告诉用户「可能需要配代理」（issue #106 的第二个诉求）')
         # 与网络无关的失败不贴这条提示（避免误导）
         self.assertEqual(mod._download_hint(ValueError('bad url')), '')
+
+if __name__ == '__main__':
+    unittest.main()

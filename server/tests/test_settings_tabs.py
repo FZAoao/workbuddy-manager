@@ -39,8 +39,9 @@ _VERIFY = _ROOT / 'dev' / 'verify_state_honesty.mjs'
 _LOCALES = _ROOT / 'web' / 'lib' / 'i18n' / 'locales'
 _NODE = shutil.which('node')
 
-# 上游 8 个 Tab 加上 fork 的补货链接入口。
-_TAB_COUNT = 9
+# 上游 9 个 Tab（含 2.x 新增的「出口线路」）加上本分支的补货链接入口。
+# 多一个少一个都要有人主动改这里（以及 CHANGELOG）。
+_TAB_COUNT = 10
 
 # 只跑 .mjs，不碰 .ts —— Node 的 type stripping 从 22.6 起才有
 _MIN_MAJOR = 22

@@ -41,7 +41,7 @@ function check(name, got, want) {
 check(
   '清单就是这 9 项（保留 fork 补货链接），顺序固定（导航顺序 = 路由顺序 = i18n 键顺序）',
   SETTINGS_TABS,
-  ['upstream', 'models', 'users', 'tokens', 'restock', 'system', 'backup', 'changelog', 'about'],
+  ['upstream', 'proxy', 'models', 'users', 'tokens', 'restock', 'system', 'backup', 'changelog', 'about'],
 );
 
 check('清单里没有重复项', new Set(SETTINGS_TABS).size, SETTINGS_TABS.length);

@@ -149,7 +149,8 @@ export default function PrizesPage() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Select value={typeFilter} onValueChange={setTypeFilter}>
-              <SelectTrigger className="h-7 w-[110px] rounded-full text-[11px]">
+              <SelectTrigger className="h-7 w-[110px] rounded-full text-[11px]"
+                            aria-label={t('prizes.filterType')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -159,7 +160,8 @@ export default function PrizesPage() {
               </SelectContent>
             </Select>
             <Select value={statusFilter} onValueChange={setStatusFilter}>
-              <SelectTrigger className="h-7 w-[110px] rounded-full text-[11px]">
+              <SelectTrigger className="h-7 w-[110px] rounded-full text-[11px]"
+                            aria-label={t('prizes.filterStatus')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -170,7 +172,8 @@ export default function PrizesPage() {
               </SelectContent>
             </Select>
             <Select value={days} onValueChange={setDays}>
-              <SelectTrigger className="h-7 w-[110px] rounded-full text-[11px]">
+              <SelectTrigger className="h-7 w-[110px] rounded-full text-[11px]"
+                            aria-label={t('prizes.filterRange')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>

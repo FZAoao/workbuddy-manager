@@ -13,6 +13,8 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 import {useT} from '@/lib/i18n/provider';
+import {errText} from '@/lib/api';
+import {notify} from '@/lib/toast';
 import {cn} from '@/lib/utils';
 
 export function ConfirmDialog({
@@ -43,7 +45,7 @@ export function ConfirmDialog({
   contentClassName?: string;
   confirmText?: string;
   destructive?: boolean;
-  /** 条件不满足时锁住确认键（例如密码不足 8 位），比点完再报错少一次往返 */
+  /** 条件不满足时锁住确认键（例如密码不足 12 位），比点完再报错少一次往返 */
   confirmDisabled?: boolean;
   onConfirm: () => void | Promise<void>;
   /**
@@ -82,6 +84,11 @@ export function ConfirmDialog({
               try {
                 await onConfirm();
                 setOpen(false);
+              } catch (err) {
+                // 以前只有 finally：业务失败会变成未处理的 rejection，弹窗不关、
+                // 界面毫无反应 —— 用户以为没点上，反复点。这里当场说清原因并
+                // 保持弹窗打开，让人能改完重试。
+                notify.err(errText(err));
               } finally {
                 setBusy(false);
               }

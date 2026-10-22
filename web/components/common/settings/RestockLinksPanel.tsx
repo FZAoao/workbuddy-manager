@@ -94,7 +94,9 @@ function TargetSelect({
   const t = useT();
   return (
     <Select value={value} onValueChange={onChange}>
-      <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
+      <SelectTrigger className="bg-background" aria-label={t('restock.targetPool')}>
+        <SelectValue />
+      </SelectTrigger>
       <SelectContent>
         {upstreams.map((upstream) => (
           <SelectItem
@@ -269,6 +271,7 @@ export function RestockLinksPanel() {
               <Switch
                 checked={form.allowOverwrite}
                 onCheckedChange={(allowOverwrite) => setForm({...form, allowOverwrite})}
+                aria-label={t('restock.adminAllowOverwrite')}
               />
               {t('restock.adminAllowOverwrite')}
             </label>
@@ -417,6 +420,7 @@ export function RestockLinksPanel() {
                       <Switch
                         checked={draft.allowOverwrite}
                         onCheckedChange={(allowOverwrite) => updateDraft(link.id, {allowOverwrite})}
+                        aria-label={t('restock.adminAllowOverwrite')}
                       />
                       {t('restock.adminAllowOverwrite')}
                     </label>

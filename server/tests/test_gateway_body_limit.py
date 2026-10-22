@@ -1,7 +1,8 @@
-"""请求体上限的回归（网关独立配置 + 读取时强制截断）。
+"""请求体上限的回归（跟随上游配置 + 读取时强制截断）。
 
-旧版网关把上游遗留的 `server.max_body_mb` 当成本端上限；上游移除该限制后，
-这个旧配置会意外拦截图片等较大的 JSON 请求。现在只使用网关自己的配置。
+真实问题：用户通过反代调用时报「请求体过大（上限 8 MiB）」，但上游
+`server.max_body_mb` 是**可配置**的（管理端设置页也能改）。本端当时把它写死
+8 MiB，于是成了隐性瓶颈——用户调大上游上限后，请求仍在本端先被 413 拦掉。
 
 另一个漏洞：原先只看 `Content-Length` 判断大小。分块传输时该头缺失、也
 可以伪造，因此超大请求体仍会被整段读进内存（正是当初要防的内存耗尽）。
@@ -21,6 +22,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from server import config  # noqa: E402
 from server.routers import gateway  # noqa: E402
+
+
+def _reset_cache() -> None:
+    gateway._body_limit_cache.update({'at': 0.0, 'bytes': 0, 'source': ''})
+    gateway._BODY_LIMIT_SOURCE['value'] = ''
 
 
 def _request(body: bytes, headers: dict | None = None) -> Request:
@@ -44,8 +50,11 @@ def _request(body: bytes, headers: dict | None = None) -> Request:
 class BodyLimitResolution(unittest.TestCase):
     """上限的取值来源。
 
-    上游已移除 `server.max_body_mb` 的请求限制；即使遗留配置文件里还有该键，
-    网关也只使用自己的 `WB_GATEWAY_MAX_BODY_MB`，避免旧值成为图片请求的隐形瓶颈。
+    上游 9d1a21b **移除了** `server.max_body_mb`（chat handler 也去掉了预拦截），
+    所以「跟随上游配置」不再是唯一来源：
+
+      · 旧版上游（配置里仍有该键）→ 继续尊重它，升级顺序不受限；
+      · 新版上游（无该键）→ 用**本端自己**的默认值（WB_GATEWAY_MAX_BODY_MB）。
 
     为什么本端不能也取消上限：上游是 Go，读的是流、能背压；本端要把完整 body
     读进内存再 json.loads（见 _read_json_body），几个并发大请求就能把内存吃光。
@@ -57,9 +66,11 @@ class BodyLimitResolution(unittest.TestCase):
         self.cfg = pathlib.Path(self._tmp.name) / 'config.json'
         self._orig = config.UPSTREAM_CONFIG
         config.UPSTREAM_CONFIG = self.cfg
+        _reset_cache()
 
     def tearDown(self) -> None:
         config.UPSTREAM_CONFIG = self._orig
+        _reset_cache()
         self._tmp.cleanup()
 
     def _mb(self, value) -> int:
@@ -67,22 +78,12 @@ class BodyLimitResolution(unittest.TestCase):
             self.cfg.unlink(missing_ok=True)
         else:
             self.cfg.write_text(json.dumps(value), encoding='utf-8')
+        _reset_cache()
         return gateway.max_body_bytes() // 1024 // 1024
 
-    def test_ignores_legacy_upstream_body_limit(self) -> None:
-        self.assertEqual(self._mb({'server': {'max_body_mb': 1}}), gateway.DEFAULT_MAX_BODY_MB)
-        self.assertEqual(self._mb({'server': {'max_body_mb': 256}}), gateway.DEFAULT_MAX_BODY_MB)
-
-    def test_large_json_image_is_not_rejected_by_legacy_limit(self) -> None:
-        self.cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
-        body = json.dumps({'model': 'm', 'messages': [{'role': 'user', 'content': [
-            {'type': 'image_url', 'image_url': {
-                'url': 'data:image/png;base64,' + ('A' * (1024 * 1024 + 1))}},
-        ]}]}).encode()
-        parsed, error = asyncio.run(gateway._read_json_body(_request(body)))
-        self.assertIsNone(error)
-        self.assertEqual(parsed['messages'][0]['content'][0]['image_url']['url'],
-                         'data:image/png;base64,' + ('A' * (1024 * 1024 + 1)))
+    def test_follows_config(self) -> None:
+        self.assertEqual(self._mb({'server': {'max_body_mb': 32}}), 32)
+        self.assertEqual(self._mb({'server': {'max_body_mb': 64}}), 64)
 
     def test_missing_config_falls_back(self) -> None:
         """读不到配置不能导致拒绝服务，退回本端默认值。"""
@@ -107,13 +108,29 @@ class BodyLimitResolution(unittest.TestCase):
                     {'server': {'max_body_mb': -5}}, {'server': {'max_body_mb': 'x'}}, {}):
             self.assertEqual(self._mb(bad), gateway.DEFAULT_MAX_BODY_MB, repr(bad))
 
-    def test_limit_comes_from_gateway_setting(self) -> None:
-        original = gateway.DEFAULT_MAX_BODY_MB
-        try:
-            gateway.DEFAULT_MAX_BODY_MB = 7
-            self.assertEqual(gateway.max_body_bytes(), 7 * 1024 * 1024)
-        finally:
-            gateway.DEFAULT_MAX_BODY_MB = original
+    def test_large_base64_image_passes_under_default_limit(self) -> None:
+        """新版上游（配置里没有遗留键）时，1 MiB 的 base64 图片不该被本端误拦。
+
+        多模态请求的 body 里，一张普通截图就上兆；上限若还按上游旧默认的 8 MiB
+        跟着遗留配置走，这类请求会在本端先被 413 掉。上限仍是**硬上限**，这里确认
+        的是默认值容得下常见图片请求。
+        """
+        self._mb({})
+        payload = 'data:image/png;base64,' + ('A' * (1024 * 1024 + 1))
+        body = json.dumps({'model': 'm', 'messages': [{'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': payload}}]}]}).encode()
+        parsed, error = asyncio.run(gateway._read_json_body(_request(body)))
+        self.assertIsNone(error)
+        self.assertEqual(parsed['messages'][0]['content'][0]['image_url']['url'], payload)
+
+    def test_result_is_cached_then_refreshes(self) -> None:
+        self.assertEqual(self._mb({'server': {'max_body_mb': 32}}), 32)
+        # 改文件但不清缓存 → 仍读旧值
+        self.cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
+        self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 32, 'TTL 内应命中缓存')
+        # 缓存过期 → 生效新值
+        gateway._body_limit_cache['at'] = 0.0
+        self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 1)
 
 
 class BodyLimitEnforcement(unittest.TestCase):
@@ -123,11 +140,10 @@ class BodyLimitEnforcement(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.cfg = pathlib.Path(self._tmp.name) / 'config.json'
         self._orig = config.UPSTREAM_CONFIG
-        self._orig_default = gateway.DEFAULT_MAX_BODY_MB
         config.UPSTREAM_CONFIG = self.cfg
-        gateway.DEFAULT_MAX_BODY_MB = 1
         # 设为 1 MiB，便于构造超限体
         self.cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
+        _reset_cache()
         self.big = json.dumps(
             {'model': 'x', 'messages': [{'role': 'user', 'content': 'a' * (2 * 1024 * 1024)}]}
         ).encode()
@@ -135,7 +151,7 @@ class BodyLimitEnforcement(unittest.TestCase):
 
     def tearDown(self) -> None:
         config.UPSTREAM_CONFIG = self._orig
-        gateway.DEFAULT_MAX_BODY_MB = self._orig_default
+        _reset_cache()
         self._tmp.cleanup()
 
     def _read(self, body: bytes, headers: dict | None = None):
@@ -173,6 +189,52 @@ class BodyLimitEnforcement(unittest.TestCase):
         _, err = self._read(raw, {'content-length': str(len(raw))})
         self.assertIsNotNone(err)
         self.assertEqual(err.status_code, 400)
+
+    def test_message_points_at_the_upstream_key_when_it_wins(self) -> None:
+        """上限来自**旧版上游**的 config.json 时，报错必须指上游那个键。
+
+        issue #180 的实际形状：用户的上游是旧版、`server.max_body_mb` 还在，
+        面板优先听它；旧文案却一律写「由环境变量 WB_GATEWAY_MAX_BODY_MB 决定」，
+        用户把环境变量改大了毫无效果，还以为面板不认这个配置。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
+            orig = config.UPSTREAM_CONFIG
+            config.UPSTREAM_CONFIG = cfg
+            _reset_cache()
+            try:
+                _, err = self._read(self.big, {})
+                msg = json.loads(err.body)['error']['message']
+                self.assertIn('上游', msg)
+                self.assertIn('server.max_body_mb', msg,
+                              '要指出上游那个键 —— 那才是用户该改的地方')
+                self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg, '也要给出删键后的替代做法')
+            finally:
+                config.UPSTREAM_CONFIG = orig
+                _reset_cache()
+
+    def test_message_says_default_when_nothing_is_configured(self) -> None:
+        """既没有上游那个键、也没设环境变量时，说清「这是默认上限、可以调大」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({}), encoding='utf-8')
+            orig = config.UPSTREAM_CONFIG
+            orig_default = gateway.DEFAULT_MAX_BODY_MB
+            config.UPSTREAM_CONFIG = cfg
+            gateway.DEFAULT_MAX_BODY_MB = 1          # 与 self.big（2 MB）配对，便于构造超限
+            _reset_cache()
+            try:
+                gateway.max_body_bytes()
+                self.assertEqual(gateway._BODY_LIMIT_SOURCE['value'], '', '没设过就应是默认值')
+                _, err = self._read(self.big, {})
+                msg = json.loads(err.body)['error']['message']
+                self.assertIn('默认上限', msg)
+                self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg)
+            finally:
+                config.UPSTREAM_CONFIG = orig
+                gateway.DEFAULT_MAX_BODY_MB = orig_default
+                _reset_cache()
 
     def test_error_message_has_guidance(self) -> None:
         """报错要说清怎么改，而不是只丢一个 413。

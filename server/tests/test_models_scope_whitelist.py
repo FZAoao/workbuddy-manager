@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -223,6 +224,83 @@ class SharedCriterionTest(unittest.TestCase):
         self.assertFalse(keysvc.model_allowed(_key(models=['glm-5.2']), '   '))
 
 
+class CatalogShrinkTest(unittest.TestCase):
+    """issue #239：上游清单里的已下架模型要按模型中心的实时目录裁掉。
+
+    上游 `/v1/models` 会列出一批腾讯早已收缩掉的旧模型（cn 域 52 个，
+    模型中心只有 20 个），下游拿它当选择器，选中后才 503。模型中心直连
+    腾讯的目录是当前可用的权威清单；取不到时原样透传，绝不能把列表清空。
+    """
+
+    def _scope(self, payload, key, mapping=None):
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: (mapping or {}) if k == 'model_map' else d):
+            return G._scope_models(payload, key)
+
+    def test_drops_ids_missing_from_tencent_catalog(self) -> None:
+        payload = {'object': 'list', 'data': [
+            {'id': 'glm-5.2'}, {'id': 'deepseek-v4.1-flash'},
+            {'id': 'global:gpt-5.6-sol'},
+        ]}
+        key = _key(realm='cn')
+        scoped = self._scope(payload, key)
+        out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], ['glm-5.2'],
+                         'cn 清单里仍留着模型中心没有的旧模型')
+
+    def test_global_prefix_is_compared_bare(self) -> None:
+        """模型中心给裸名，上游国际版给 `global:` 前缀，前缀不能导致误删。"""
+        payload = {'data': [{'id': 'global:gpt-5.6-sol'}]}
+        key = _key(realm='global')
+        out = G._filter_catalog_models(payload, key, 'global', {'gpt-5.6-sol'})
+        self.assertEqual([m['id'] for m in out['data']], ['global:gpt-5.6-sol'])
+
+    def test_alias_entry_survives(self) -> None:
+        """白名单里的别名指向仍在目录里的模型时，别名条目不能被裁掉。"""
+        mapping = {'gpt-4o-mini': 'glm-5.2'}
+        key = _key(models=['gpt-4o-mini'])
+        scoped = self._scope({'data': [{'id': 'glm-5.2'}]}, key, mapping)
+        self.assertEqual([m['id'] for m in scoped['data']], ['gpt-4o-mini'])
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: mapping if k == 'model_map' else d):
+            out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], ['gpt-4o-mini'],
+                         '别名指向的模型仍可用，别名不该被删')
+
+    def test_alias_to_dead_model_is_dropped(self) -> None:
+        """别名指向的模型已下架 → 别名同样不可用，应删。"""
+        mapping = {'dead-alias': 'old-model'}
+        key = _key(models=['dead-alias'])
+        scoped = self._scope({'data': [{'id': 'old-model'}, {'id': 'glm-5.2'}]},
+                             key, mapping)
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: mapping if k == 'model_map' else d):
+            out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], [])
+
+    def test_upstream_fallback_source_skips_filter(self) -> None:
+        """目录来源是上游回退（同一份旧表）时不做裁剪。"""
+        payload = {'data': [{'id': 'old-model'}]}
+        key = _key(realm='cn')
+        cat = {'source': 'upstream', 'models': [{'id': 'glm-5.2'}]}
+        with mock.patch.object(G.modelcatalog, 'catalog',
+                               mock.AsyncMock(return_value=cat)):
+            out = asyncio.run(G._drop_models_outside_catalog(payload, key))
+        self.assertEqual([m['id'] for m in out['data']], ['old-model'])
+
+    def test_catalog_failure_keeps_list(self) -> None:
+        """目录取不到/超时 → 原样返回，不能把列表清空。"""
+        payload = {'data': [{'id': 'old-model'}]}
+        key = _key(realm='cn')
+
+        async def _boom(realm):
+            raise TimeoutError('catalog timeout')
+
+        with mock.patch.object(G.modelcatalog, 'catalog', _boom):
+            out = asyncio.run(G._drop_models_outside_catalog(payload, key))
+        self.assertEqual([m['id'] for m in out['data']], ['old-model'])
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -384,6 +462,11 @@ class CachedIdsTest(unittest.TestCase):
 class HintFrontendWiringTest(unittest.TestCase):
     """前端要真的显示这个提示，且「查不了」不能显示成「全部正确」。"""
 
+    def _component(self) -> str:
+        return (Path(__file__).resolve().parents[2]
+                / 'web/components/common/keys/ModelWhitelistInput.tsx'
+                ).read_text(encoding='utf-8')
+
     def _page(self) -> str:
         return (Path(__file__).resolve().parents[2]
                 / 'web/app/(main)/keys/page.tsx').read_text(encoding='utf-8')
@@ -405,11 +488,23 @@ class HintFrontendWiringTest(unittest.TestCase):
                       'checked=false 时没退回 null')
 
     def test_editing_invalidates_previous_result(self) -> None:
-        """改了内容要作废上次结论，否则显示的是**过期**的「都对」。"""
+        """改了内容要作废上次结论，否则显示的是**过期**的「都对」。
+
+        #141 之后白名单换成组件（`ModelWhitelistInput`：可勾选的清单 + 手输），
+        但这条不变量没变：凡是把用户改动写回 `form.models` 的地方，都要顺手把上次
+        校验结果清掉。
+        """
         src = self._page()
-        seg = src[src.index('onChange={(e) => {'):]
-        seg = seg[:seg.index('onBlur')]
+        start = src.index('<ModelWhitelistInput')
+        seg = src[start:src.index('onBlur', start)]
         self.assertIn('setUnknownModels(null)', seg, '改了白名单却留着上次的校验结果')
+        self.assertIn('models: next', seg, '组件回传的值没写回 form.models')
+        # 打字过程中也要作废：输入框里的草稿要失焦才提交，只清 onChange 的话
+        # 「改到一半」这一段里提示还是上一版的值（浏览器验收实测踩到，见
+        # dev/verify_whitelist_hint.py 的第 3 步）。
+        self.assertIn('onEdit=', seg, '打字时不作废旧结论')
+        comp = self._component()
+        self.assertIn('onEdit?.()', comp, '组件没有把「正在编辑」告诉父组件')
 
     def test_all_locales_define_the_key(self) -> None:
         import json

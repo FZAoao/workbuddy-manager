@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import os
 import re
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,14 @@ from .realm import (
 )
 
 from .errtext import err_text
+from .filelock import file_lock
+
+class AccountExistsError(ValueError):
+    """Raised when an import attempts to replace an existing account without consent."""
+
+    def __init__(self, uid: str) -> None:
+        self.uid = uid
+        super().__init__('账号已存在')
 
 # 扫码 state 缓存：state -> (登记时间, 发起时的版本)。
 # 记 realm 是为了在回调时校验一致——若用户先开国内版的码、又切到国际版再轮询，
@@ -65,6 +75,30 @@ STATE_TTL = 900
 # hy4-preview-f / kimi-k2.8-preview 都从这里来（见 fetch_models 的说明）。
 # 该端点有 UA 门禁：只有三段式 CLI UA（我们 _ua 的形态）能过，web UA 被 400 拒。
 V3_CONFIG_PATH = '/v3/config'
+
+# 「活动补偿」两个端点（2026-10-16 的 DeepSeek 故障补偿公告，网页入口
+# https://www.workbuddy.cn/profile/plans-usage 的「领取」按钮）。
+#
+# **路径不带 `/v2`**，这与 daily-checkin / get-user-resource 不同 —— 那两个两种
+# 前缀都通，而这两个只有非前缀形式：2026-10-16 实测
+#
+#     POST https://www.codebuddy.cn/billing/meter/compensation-status      → 401（存在，待鉴权）
+#     POST https://www.codebuddy.cn/v2/billing/meter/compensation-status   → 404
+#     POST https://www.codebuddy.cn/billing/meter/claim-compensation       → 401
+#     POST https://www.codebuddy.cn/v2/billing/meter/claim-compensation    → 404
+#
+# 所以**不能**走 `billing_paths()`（它给国内版拼的正是 `/v2`）：那样每次都会 404，
+# 而 404 的表现是「无可领补偿」，看起来跟「今天没得领」一模一样 —— 静默失效。
+# 端点名与网页 bundle（assets.workbuddy.cn/web/usercenter）里的调用逐字一致。
+#
+# **基址用 codebuddy.cn（= desktop 客户端的 billing 基址），不是公告链接里的
+# workbuddy.cn**：两条都实测存在（都是 401），但我们的账号是客户端账号，出生入死的
+# 是客户端那套 Origin/UA/身份头；而该域上的领取历史有效（升级日志里出现过
+# 「compensation ok (+100 credit)」）。公告页与客户端应是同一后端的不同品牌前端。
+# 将来若要改基址，先确认身份头（Origin/Referer）一起改 —— 不匹配的 Origin 正是
+# 风控最容易挑出来的形态。
+COMPENSATION_STATUS_PATH = '/billing/meter/compensation-status'
+COMPENSATION_CLAIM_PATH = '/billing/meter/claim-compensation'
 
 
 def _envelope(resp: httpx.Response) -> tuple[int, Any]:
@@ -104,22 +138,58 @@ def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
     return billing_headers(realm, auth)
 
 
-def _account_http_client(auth: dict):
+def _account_http_client(auth: dict, *, lane: str = ''):
+    """账号出站客户端（按账号线路选代理）。
+
+    `lane` 透传给 `config.http_client`，把客户端**按用途分池**（issue #161）：
+    批量任务（刷积分/签到/刷新令牌）与交互操作（单号测活）各有各的连接预算，
+    否则批量把池占满时，用户手点的那次测活会一直排队到 PoolTimeout。
+    """
     proxy = config.account_proxy(auth)
+    # lane 只在**非空**时才传：既有调用点（签到/积分/刷新…）的调用形态保持
+    # `http_client(15, connect=5)` 一字不差 —— 那些路径的 mock 断言就是这么写的，
+    # 多传一个空 lane 会把它们全打红，而语义上「默认车道」本来就不该有痕迹。
+    extra = {'lane': lane} if lane else {}
     if proxy is None:
-        return config.http_client(config.TENCENT_TIMEOUT, connect=5)
-    return config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy)
+        return config.http_client(config.TENCENT_TIMEOUT, connect=5, **extra)
+    return config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy, **extra)
+
+
+def _login_net_hint(proxy_name: str, exc: Exception) -> str:
+    """把「扫码登录」出站的网络错误翻成可执行的中文提示（issue #194）。
+
+    为什么这条要专门翻译：登录是唯一「用户正站在弹窗前、失败就卡死」的出站调用。
+    此前 httpx 的异常直接抛到路由层，没被 `except RuntimeError` 接住 → FastAPI 兜成
+    500 + 英文 `Internal Server Error`，界面上就是一句看不懂的英文，用户既不知道是
+    线路问题也不知道该改哪里。报告人正是这么被卡住的：换了一条解析不了 .cn 的国家
+    线路，二维码一直出不来，关掉代理才好 —— 修复前他从错误里看不出这层关系。
+    """
+    detail = err_text(exc)
+    if proxy_name:
+        return (
+            f'线路「{proxy_name}」连不上腾讯登录接口：{detail}。'
+            '常见原因：这条线路访问不了国内域名、需要额外认证、或已经失效 —— '
+            '换一条线路，或先在弹窗里关掉它再试'
+        )
+    return f'连不上腾讯登录接口：{detail}。请检查这台机器的网络出口（DNS 与外网连通性）'
 
 
 async def start_login(realm: Realm = CN, proxy_name: str = '') -> dict:
-    """发起扫码登录。realm 决定用哪套端点与 Origin（默认国内版）。"""
-    async with _account_http_client({'proxy': proxy_name}) as client:
-        resp = await client.post(
-            f'{chat_base(realm)}/v2/plugin/auth/state',
-            params={'platform': 'CLI'},
-            json={},
-            headers=_hdr(realm),
-        )
+    """发起扫码登录。realm 决定用哪套端点与 Origin（默认国内版）。
+
+    网络层失败统一转成 `RuntimeError`（带可执行的中文原因，见 `_login_net_hint`）：
+    路由层把它转 502，界面就能显示「哪条线路连不上、该怎么办」，而不是英文 500。
+    """
+    try:
+        async with _account_http_client({'proxy': proxy_name}) as client:
+            resp = await client.post(
+                f'{chat_base(realm)}/v2/plugin/auth/state',
+                params={'platform': 'CLI'},
+                json={},
+                headers=_hdr(realm),
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(_login_net_hint(proxy_name, exc)) from exc
     code, data = _envelope(resp)
     if code != 0 or not data:
         raise RuntimeError(f'获取授权链接失败 code={code}')
@@ -163,26 +233,31 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
         return {'status': 'realm_mismatch', 'expected': reg_realm, 'got': realm}
     realm = reg_realm
 
-    async with _account_http_client({'proxy': proxy_name}) as client:
-        resp = await client.get(
-            f'{chat_base(realm)}/v2/plugin/auth/token',
-            params={'state': state},
-            headers=_hdr(realm),
-        )
-        code, data = _envelope(resp)
-        if code != 0 or not data or not data.get('accessToken'):
-            return {'status': 'waiting'}
+    # 出站失败同样翻成可执行的中文（与 start_login 同一口径）：中途线路挂掉时，
+    # 前端轮询此前会拿到英文 500，用户看不出是线路的问题。
+    try:
+        async with _account_http_client({'proxy': proxy_name}) as client:
+            resp = await client.get(
+                f'{chat_base(realm)}/v2/plugin/auth/token',
+                params={'state': state},
+                headers=_hdr(realm),
+            )
+            code, data = _envelope(resp)
+            if code != 0 or not data or not data.get('accessToken'):
+                return {'status': 'waiting'}
 
-        access_token = data['accessToken']
-        refresh_token = data.get('refreshToken', '')
-        expires_in = int(data.get('expiresIn', 3600) or 3600)
-        domain = data.get('domain', '')
+            access_token = data['accessToken']
+            refresh_token = data.get('refreshToken', '')
+            expires_in = int(data.get('expiresIn', 3600) or 3600)
+            domain = data.get('domain', '')
 
-        acct_resp = await client.get(
-            f'{chat_base(realm)}/v2/plugin/login/account',
-            params={'state': state},
-            headers=_hdr(realm, access_token),
-        )
+            acct_resp = await client.get(
+                f'{chat_base(realm)}/v2/plugin/login/account',
+                params={'state': state},
+                headers=_hdr(realm, access_token),
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(_login_net_hint(proxy_name, exc)) from exc
     _, acct = _envelope(acct_resp)
     acct = acct or {}
     uid = acct.get('uid')
@@ -284,33 +359,35 @@ def update_auth_tokens(filename: str, fields: dict,
     也不要把一份坏内容覆盖到用户仅存的凭证上）。
     """
     target = _safe_auth_path(filename, auth_dir)
-    try:
-        raw = json.loads(target.read_text(encoding='utf-8'))
-    except FileNotFoundError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'账号文件无法解析，已放弃写入：{err_text(exc)}') from exc
-    if not isinstance(raw, dict):
-        raise ValueError('账号文件格式异常，已放弃写入')
+    # 读—改—写必须串行（见 filelock.py）：否则续期与其它写者会互相覆盖。
+    with file_lock(target):
+        try:
+            raw = json.loads(target.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f'账号文件无法解析，已放弃写入：{err_text(exc)}') from exc
+        if not isinstance(raw, dict):
+            raise ValueError('账号文件格式异常，已放弃写入')
 
-    auth = raw.get('auth')
-    if not isinstance(auth, dict):
-        auth = {}
-        raw['auth'] = auth
-    if 'access_token' in fields:
-        auth['accessToken'] = fields['access_token']
-    if 'refresh_token' in fields:
-        auth['refreshToken'] = fields['refresh_token']
-    if 'expires_at' in fields:
-        auth['expiresAt'] = fields['expires_at']
-    if 'domain' in fields:
-        auth['domain'] = fields['domain']
-    # realm 若缺失则补上（与 write_auth_file 同口径，用 resolve_realm 不含逃生门）
-    if not auth.get('realm'):
-        auth['realm'] = resolve_realm(raw.get('realm'),
-                                      str(auth.get('domain') or ''))
+        auth = raw.get('auth')
+        if not isinstance(auth, dict):
+            auth = {}
+            raw['auth'] = auth
+        if 'access_token' in fields:
+            auth['accessToken'] = fields['access_token']
+        if 'refresh_token' in fields:
+            auth['refreshToken'] = fields['refresh_token']
+        if 'expires_at' in fields:
+            auth['expiresAt'] = fields['expires_at']
+        if 'domain' in fields:
+            auth['domain'] = fields['domain']
+        # realm 若缺失则补上（与 write_auth_file 同口径，用 resolve_realm 不含逃生门）
+        if not auth.get('realm'):
+            auth['realm'] = resolve_realm(raw.get('realm'),
+                                          str(auth.get('domain') or ''))
 
-    _atomic_write_json(target, raw)
+        _atomic_write_json(target, raw)
 
 
 def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
@@ -329,13 +406,20 @@ def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
 
 
 def _validated_uid(value: object) -> str:
+    """校验账号 uid 的字符集（它会拼进 auths 目录下的文件名）。
+
+    单独抽出来是因为**两处**都要用：`write_auth_file`（登录响应落盘）与
+    `write_imported_auth`（导入 / 公开补货落盘）。同一条规则写两遍迟早会漏一边，
+    而漏掉的那边就是路径穿越。
+    """
     uid = str(value)
     if not re.fullmatch(r'[0-9A-Za-z_-]{1,80}', uid):
         raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
     return uid
 
 
-def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
+def write_auth_file(account: dict, auth_dir: Path | None = None,
+                    *, allow_overwrite: bool = True) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
 
     realm 写在 `auth` 对象内（与 domain 同级）——上游就是从这里读的。
@@ -352,45 +436,67 @@ def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, b
     base = auth_dir or config.AUTH_DIR
     base.mkdir(parents=True, exist_ok=True)
     target = base / f'workbuddy-{uid}.json'
+    disabled_target = base / f'{target.name}.disabled'
+    if not target.exists() and disabled_target.exists():
+        target = disabled_target
     existed = target.exists()
+    if existed and not allow_overwrite:
+        raise AccountExistsError(uid)
     domain = account.get('domain', '')
     resolved = resolve_realm(account.get('realm'), domain)
 
-    # 保留旧的 device_token（若有）。读失败不影响主流程。
-    old_device_token = ''
-    old_proxy = ''
-    if existed:
-        try:
-            old = json.loads(target.read_text(encoding='utf-8'))
-            if isinstance(old, dict):
-                old_device_token = str(old.get('device_token') or '')
-                old_proxy = str(old.get('proxy') or '')
-        except Exception:  # noqa: BLE001
-            old_device_token = ''
+    # 读旧值 → 合并 → 原子写，整体串行：重登/导入不能把别人刚写的字段盖掉。
+    with file_lock(target):
+        # 保留旧的 device_token（若有）。读失败不影响主流程。
+        old_device_token = ''
+        old_proxy = ''
+        old_weight = None
+        if existed:
+            try:
+                old = json.loads(target.read_text(encoding='utf-8'))
+                if isinstance(old, dict):
+                    old_device_token = str(old.get('device_token') or '')
+                    old_proxy = str(old.get('proxy') or '')
+                    old_weight = old.get('weight')
+            except Exception:  # noqa: BLE001
+                old_device_token = ''
 
-    payload = {
-        'account': {
-            'uid': uid,
-            'enterpriseId': account.get('enterprise_id', ''),
-            'nickname': account.get('nickname', ''),
-        },
-        'auth': {
-            'accessToken': account['access_token'],
-            'refreshToken': account.get('refresh_token', ''),
-            'expiresAt': account['expires_at'],
-            'domain': domain,
-            'realm': resolved,
-        },
-    }
-    if old_device_token:
-        payload['device_token'] = old_device_token
+        payload = {
+            'account': {
+                'uid': uid,
+                'enterpriseId': account.get('enterprise_id', ''),
+                'nickname': account.get('nickname', ''),
+            },
+            'auth': {
+                'accessToken': account['access_token'],
+                'refreshToken': account.get('refresh_token', ''),
+                'expiresAt': account['expires_at'],
+                'domain': domain,
+                'realm': resolved,
+            },
+        }
+        if old_device_token:
+            payload['device_token'] = old_device_token
 
-    proxy_name = str(account.get('proxy', old_proxy) or '').strip()
-    if proxy_name:
-        payload['proxy'] = proxy_name
+        # 空串同样回退到旧值（`or old_proxy`，而不是只对「键缺失」生效的默认值）：
+        # 登录流（account 里通常没有这个键）与**导入流**（`_uploaded_account` 恒带上
+        # `'proxy': ''`）两条路都要「文件没提就不动」。否则覆盖导入一份没写 proxy 的
+        # 文件会把已绑定的线路**静默清掉**——出口无声改变正是这个功能最忌讳的事
+        # （与上面 device_token「读旧文件保留」的语义对齐）。
+        proxy_name = str(account.get('proxy') or old_proxy or '').strip()
+        if proxy_name:
+            payload['proxy'] = proxy_name
 
-    # 原子替换的完整理由见 `_atomic_write_json`（热加载读到空文件会误判账号被删）
-    _atomic_write_json(target, payload)
+        # 手写权重同 device_token / proxy：文件没提就沿用旧值。
+        # 重新登录/覆盖导入是「按响应重建整份文件」，不读旧值就会把
+        # 用户设的权重静默清零（#187 的同一条坑）。
+        weight = account.get('weight', old_weight)
+        if (isinstance(weight, (int, float)) and not isinstance(weight, bool)
+                and weight > 0):
+            payload['weight'] = weight
+
+        # 原子替换的完整理由见 `_atomic_write_json`（热加载读到空文件会误判账号被删）
+        _atomic_write_json(target, payload)
     return target.name, existed
 
 
@@ -695,6 +801,93 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
         return -1, f'签到异常: {err_text(exc)}'
 
 
+async def compensation_status(access_token: str | dict,
+                              realm: Realm = CN) -> tuple[bool, dict, str]:
+    """查询「活动补偿」当前状态（有没有得领、领过没）。
+
+    页面口径（`/profile/plans-usage` 的「领取」模块，2026-10 补偿公告）读的字段：
+    `claimed` / `claimed_at` / `claimed_text` / `button_text` / `credit_num` / `title`。
+    返回 `(ok, data, message)`；`ok=False` 时 message 是原因（网络/业务错误）。
+
+    **只在官方网页上才有的可领状态**：这个端点比「直接领」多一次请求，但它能回答
+    「有得领吗」，而领取接口在没得领时只回业务错误——用户看到「无可领」无法区分
+    「已经领过了」和「活动还没给我」。
+    """
+    try:
+        async with _account_http_client(access_token if isinstance(access_token, dict) else {}) as client:
+            resp = await client.post(
+                f'{billing_base(realm)}{COMPENSATION_STATUS_PATH}',
+                json={},
+                headers=_billing_hdr(realm, access_token),
+            )
+        code, data = _envelope(resp)
+        if code != 0:
+            return False, {}, f'查询返回 code={code}'
+        if not isinstance(data, dict):
+            return False, {}, '查询返回结构无法识别'
+        return True, data, '已查询'
+    except Exception as exc:  # noqa: BLE001
+        return False, {}, f'查询异常: {err_text(exc)}'
+
+
+async def claim_compensation(access_token: str | dict,
+                             realm: Realm = CN) -> tuple[str, int, str]:
+    """领取「活动补偿」（有则领，领过/没有则跳过）。
+
+    返回 `(status, credit, message)`，status 只有四种取值 —— **分开「无可领」与
+    「失败」是刻意的**：上游对「没有可领的补偿」和「已经领过了」都回业务错误，
+    而这两种都不是故障。混成一个 ok=False，界面会把「今天本来就没得领」报成
+    「N 个账号失败」，用户于是反复重试一个永远不会成功的动作。
+
+      · `claimed` —— 本次到账（credit 是积分，回执缺字段记 0）
+      · `nothing` —— 业务错误：没有可领的补偿 / 已经领过
+      · `failed`  —— 网络或协议层失败（可重试）
+      · `skipped` —— 国际版没有这个活动，未发请求
+    """
+    if not supports_checkin(realm):
+        # 公告只面向国内版（原话「面向 WorkBuddy 国内版全量用户」）；国际版连这个
+        # 模块都没有，打过去只会白吃一次 4xx —— 与签到的门控同理。
+        return 'skipped', 0, '国际版无此活动，已跳过'
+    try:
+        async with _account_http_client(access_token if isinstance(access_token, dict) else {}) as client:
+            resp = await client.post(
+                f'{billing_base(realm)}{COMPENSATION_CLAIM_PATH}',
+                json={},
+                headers=_billing_hdr(realm, access_token),
+            )
+        code, data = _envelope(resp)
+        if code == 0:
+            credit = 0
+            if isinstance(data, dict):
+                raw = data.get('credit')
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    credit = int(raw)
+            return 'claimed', credit, ('已领取 +%d 积分' % credit) if credit else '已领取（回执未给积分数）'
+        # 业务错误：**不是**故障（HTTP 多半还是 200，只是信封里的 code != 0）
+        return 'nothing', 0, f'无可领补偿（code={code}）'
+    except Exception as exc:  # noqa: BLE001
+        return 'failed', 0, f'领取异常: {err_text(exc)}'
+
+
+def compensation_already_claimed(data: object) -> bool:
+    """补偿状态回执是否表示「已经领过」。
+
+    字段按网页 bundle 的口径解析，且**宽容**：三个字段任一能证明领过就算领过
+    （`claimed` 布尔 / `claimed_at` 时间 / `claimed_text` 文案）。字段全缺时返回
+    False —— 那表示我们认不出这个结构，此时应继续尝试领取，而不是当成「已领」
+    把机会放过（认不出 ≠ 领过了）。
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get('claimed') is True:
+        return True
+    for key in ('claimed_at', 'claimed_text'):
+        value = data.get(key)
+        if value not in (None, '', 0):
+            return True
+    return False
+
+
 async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list[dict]]:
     """查询账号**实时**积分余额与各套餐到期时间。
 
@@ -733,10 +926,25 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
             '%Y-%m-%d %H:%M:%S', time.localtime(now + 365 * 101 * 24 * 3600)
         ),
     }
+    enterprise_id = str(auth.get('enterprise_id') or '').strip()
     try:
-        # 路径按版本分派；国际版以无 /v2 前缀为首选、404 时回落（与国内版相反）
-        # 头走 billing 域（带 X-User-Id 等身份头，对齐上游 BillingHeaders）
+        # 头走 billing 域（带 X-User-Id / X-Enterprise-Id / X-Tenant-Id 身份头，
+        # 对齐上游 BillingHeaders）。企业与个人两条路共用同一份头。
         hdr = _billing_hdr(realm, auth)
+
+        # ── 企业账号：额度不在个人「资源包」体系内 ──────────────
+        # 个人端点 get-user-resource 对企业账号恒返回空 Accounts（我校的
+        # _extract_resource_accounts 解析不出来 → "响应结构无法识别" → 显示 0）。
+        # 企业额度必须走专用端点 get-enterprise-user-usage。
+        #
+        # 口径差异（与个人接口**相反**，极易搞错）：
+        #   个人：CapacityRemain 就是「剩余」
+        #   企业：credit 是**本周期已用**，limitNum 是**分配给该账号的额度**
+        #        → remain = limitNum - credit
+        #   limitNum == -1 表示不限量
+        if enterprise_id:
+            return await _fetch_enterprise_credits(realm, auth, hdr)
+
         resp = None
         async with _account_http_client(auth) as client:
             for path in billing_paths(realm, 'user-resource'):
@@ -772,6 +980,64 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
         return False, None, f'查询异常: {err_text(exc)}', []
+
+
+
+def _enterprise_cycle_expiry(data: dict) -> int | None:
+    """解析企业额度的周期结束时间（cycleEndTime，UTC+8 墙钟字符串）。
+
+    上游格式 "2026-11-13 23:59:59"，与个人套餐 CycleEndTime 同口径。
+    解析失败返回 None —— 调用方据此跳过 expiries，不让倒计时显示错时间。
+    """
+    raw = str(data.get('cycleEndTime') or '').strip()
+    if not raw:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            st = time.strptime(raw, fmt)
+        except (ValueError, OverflowError):
+            continue
+        # 上游给的是 UTC+8 墙钟。calendar.timegm 按 UTC 解释 st，
+        # 减 8 小时即得到该墙钟对应的真实 epoch。
+        return int(calendar.timegm(st) - 8 * 3600)
+    return None
+
+
+async def _fetch_enterprise_credits(
+    realm: Realm, auth: dict, hdr: dict
+) -> tuple[bool, int | float | None, str, list[dict]]:
+    """企业账号额度查询（get-enterprise-user-usage）。
+
+    返回与 fetch_credits 同结构：(ok, credits, message, expiries)。
+    口径：上游 credit 是**已用**、limitNum 是**配额**，
+    故 remain = limitNum - credit（与个人接口语义相反）。
+    """
+    path = '/v2/billing/meter/get-enterprise-user-usage'
+    try:
+        async with _account_http_client(auth) as client:
+            resp = await client.post(
+                f'{billing_base(realm)}{path}', json={}, headers=hdr
+            )
+        code, data = _envelope(resp)
+        if code != 0 or not isinstance(data, dict):
+            return False, None, f'企业额度查询失败 code={code}', []
+
+        raw_limit = data.get('limitNum')
+        limit = float(raw_limit) if raw_limit is not None else 0.0
+        if limit < 0:
+            return True, None, '企业额度不限量', []
+
+        used = float(data.get('credit') or 0.0)
+        remain = max(0.0, limit - used)
+        credits = _round_credits(remain)
+
+        expiries: list[dict] = []
+        at = _enterprise_cycle_expiry(data)
+        if at is not None and remain > 0:
+            expiries.append({'at': at, 'amount': credits})
+        return True, credits, '查询成功（企业额度）', expiries
+    except Exception as exc:  # noqa: BLE001
+        return False, None, f'企业额度查询异常: {err_text(exc)}', []
 
 
 async def fetch_models(auth: dict) -> tuple[bool, list | str]:
@@ -1134,6 +1400,17 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     _dt = device_token_for(auth)
     if _dt:
         headers['X-Device-Token'] = _dt
+    # 会话头族（issue #193）：上游 2026-10-16 起对**部分账号**灰度启用渠道校验，
+    # 缺 X-Conversation-ID 即判 11-128「conversation id missing」—— 被灰度到的账号在
+    # 探测里必红（真实对话走网关，同一族头由上游补）。这里补齐官方客户端那几支；
+    # 四个 ID 各有语义（会话 / 轮 / 消息 / 根），不要图省事复用成同一个值。
+    headers.update({
+        'X-Conversation-ID': uuid.uuid4().hex,
+        'X-Conversation-Request-ID': uuid.uuid4().hex,
+        'X-Conversation-Message-ID': uuid.uuid4().hex,
+        'X-Root-Request-ID': uuid.uuid4().hex,
+        'X-Trace-ID': uuid.uuid4().hex,
+    })
 
     payload = {
         'model': model,
@@ -1153,19 +1430,30 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     }
 
     started = _time.time()
-    # 两个版本的路径现在都是恒定的 `/v2/chat/completions`（上游 #119 统一，见
-    # chat_paths 注释）。这里仍按「候选路径」逐个尝试，是因为 chat_paths 返回的
-    # 就是列表、且将来可能再加候选；但**不能**因此以为现在有回落保护 ——
-    # 列表只有一个元素时，404/405 会直接走下面的报错分支。
+    # 路径候选：/v2 优先、/console 兜底（见 realm.chat_paths 的注释）。这里逐个尝试，
+    # 触发回落的条件是**渠道校验**或 404/405：2026-10-17 上游给 /v2 加了渠道强校验，
+    # 被校验到的请求回「没通过渠道校验」，而官方客户端走的 /console 正常放行 ——
+    # 用户报告里的「连通性测试被拦、换 /console 就正常」正是这条。
     try:
-        async with _account_http_client(auth) as client:
-            for path in chat_paths(realm):
+        paths = chat_paths(realm)
+        # lane='probe'：测活是**用户正在等**的那一次请求，给它独立连接池，
+        # 不被并发的批量任务（刷积分/签到）挤到 pool 超时（issue #161）。
+        async with _account_http_client(auth, lane='probe') as client:
+            for idx, path in enumerate(paths):
                 async with client.stream(
                     'POST', f'{base}{path}', json=payload, headers=headers,
                 ) as resp:
                     if resp.status_code >= 400:
                         raw = (await resp.aread()).decode('utf-8', errors='replace')
                         code, msg = _parse_error_body(raw, resp.status_code)
+                        channel_check = _is_channel_check(code, raw)
+                        if channel_check and idx < len(paths) - 1:
+                            continue  # 换下一条路径再试，别当成账号问题
+                        if channel_check:
+                            # 两条都被拦：说清「不是账号问题」，否则用户会以为号坏了去重扫。
+                            return False, ('这次调用被上游的渠道校验拦下了（已试过 ' +
+                                           '/'.join(paths) + '）—— 账号本身没问题；'
+                                           '请先升级到最新版本，仍不行就把这句反馈给维护者')
                         return False, _explain_code(code, msg)
                     # 读到首个非空数据块即可确认账号可用，无需等流结束
                     async for chunk in resp.aiter_bytes():
@@ -1177,6 +1465,21 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         return False, f'请求异常: {err_text(exc)}'
 
+
+
+def _is_channel_check(code: object, raw: str) -> bool:
+    """判上游的「渠道校验」拒绝（与上游 `IsChannelCheck` 同一口径）。
+
+    指纹**两条同时成立**：业务码（实测体里是带横线的写法，报告方另见无横线写法，
+    两种都认）**且**文案里出现渠道校验的措辞。只认码不行 —— 同一个码还承载
+    「内容审核拦截」，那种要按内容问题处理（不换路径）。
+    码的字面量用拼接构造：它极易手抄成 1138/1128，而判据写错不会有人发现。
+    """
+    text = str(code or '')
+    if '11-128' not in text and '11128' not in text:
+        return False
+    low = raw.lower()
+    return ('渠道校验' in raw or 'channel verification' in low or 'official client' in low)
 
 def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
     """错误响应可能是 {code,msg} 信封，也可能是纯文本。"""

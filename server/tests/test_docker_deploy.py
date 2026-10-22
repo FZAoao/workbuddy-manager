@@ -54,7 +54,7 @@ class _Rep:
     def set_target_version(self, tag: str) -> None:
         self.state['target_version'] = tag
 
-    def set_signature(self, status: str, detail: str = '') -> None:
+    def set_integrity(self, status: str, digest: str = '') -> None:
         self.state['signature'] = {'status': status, 'detail': detail}
 
     def finish(self, ok: bool) -> None:
@@ -317,26 +317,29 @@ class ComposeCommandTest(unittest.TestCase):
                               '两个都没有时应返回 None，由调用方给出可执行的修法')
 
     def test_missing_compose_raises_actionable_error(self) -> None:
-        """都没有时要报「怎么修」，而不是让用户对着 No such file 发呆。"""
+        """都没有时要报「怎么修」，而不是让用户对着 No such file 发呆。
+
+        `_docker_unusable_hint` 一起放过：本机没装 docker（或 daemon 没起）时，
+        重建会先判定「docker 不可用」并**跳过**上游（那是另一条路径，有专门用例），
+        这条测的是「compose 命令缺失 → 给出可执行的修法」。
+        """
         m = self.mod
         with tempfile.TemporaryDirectory() as upstream_dir, \
              mock.patch.object(m, 'UPSTREAM_DIR', Path(upstream_dir)), \
              mock.patch.object(m, '_has_compose_v2', return_value=False), \
              mock.patch.object(m, '_has_compose_v1', return_value=False), \
-             mock.patch.object(m, '_read_upstream_ref', return_value=''), \
-             mock.patch.object(m, '_compose_looks_customized', return_value=False), \
-             mock.patch.object(m, '_missing_copy_sources', return_value=[]):
-            (m.UPSTREAM_DIR / '.git').mkdir(parents=True, exist_ok=True)
+             mock.patch.object(m, '_docker_unusable_hint', return_value=''), \
+             mock.patch.object(m, '_missing_copy_sources', return_value=[]), \
+             mock.patch.object(m, '_release_root',
+                               return_value=(Path('/tmp/pkg'), {})), \
+             mock.patch.object(m, '_sync_bundled_upstream', return_value=1), \
+             mock.patch.object(m, 'enforce_local_bind', return_value=None):
             rep = _Rep()
-            try:
-                with self.assertRaises(RuntimeError) as ctx:
-                    m.update_upstream(rep)
-                msg = str(ctx.exception)
-                self.assertIn('compose', msg)
-                self.assertIn('Dockerfile', msg, '应给出可执行的修法')
-            finally:
-                import shutil as _sh
-                _sh.rmtree(m.UPSTREAM_DIR / '.git', ignore_errors=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                m.update_upstream(rep)
+            msg = str(ctx.exception)
+            self.assertIn('compose', msg)
+            self.assertIn('Dockerfile', msg, '应给出可执行的修法')
 
 
 class ComposeLocalCustomizationTest(unittest.TestCase):
@@ -372,34 +375,53 @@ class ComposeLocalCustomizationTest(unittest.TestCase):
         self.assertIn('1panel-network', out, '用户的网络配置被改了')
         self.assertIn('external: true', out, '用户的 external 声明被改了')
 
-    def test_customization_detected_ignoring_our_port_change(self) -> None:
-        """只有**用户的**改动才算定制；我们自己做的端口收敛不算。
+    def test_container_gateway_bind_for_host_docker_internal(self) -> None:
+        """issue #243：容器经 host.docker.internal 连上游时不能绑宿主回环。
 
-        否则每次更新都会把旧 compose 原样写回，上游新增的 compose 字段
-        永远进不来（把「保护定制」变成「冻结配置」）。
+        Linux 上容器访问不到宿主的 127.0.0.1；收敛到回环会让更新后上游
+        永远「不可用」。应绑定宿主网桥地址（容器可达、非公网）。
         """
-        m = self.mod
-        head = 'services:\n  wb2api:\n    ports:\n      - "7863:7863"\n'
-        with tempfile.TemporaryDirectory() as td:
-            up = Path(td)
-            (up / 'docker-compose.yml').write_text(
-                m._port_converged(head), encoding='utf-8')
-            with mock.patch.object(m, 'UPSTREAM_DIR', up), \
-                 mock.patch.object(m, 'run', return_value=(0, head)):
-                self.assertFalse(m._compose_looks_customized(self.rep),
-                                 '把我们的端口收敛当成了用户定制 —— 会冻结上游 compose 更新')
+        sample = 'services:\n  wb2api:\n    ports:\n      - "7863:7863"\n'
+        env = {'WB2API_BASE': 'http://host.docker.internal:7863',
+               'WB_UPSTREAM_BIND': ''}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(self.mod.socket, 'gethostbyname',
+                                  return_value='172.17.0.1'):
+            out = self.mod._port_converged(sample)
+        self.assertIn('"172.17.0.1:7863:7863"', out,
+                      '容器部署应绑宿主网桥地址，否则容器连不上上游')
 
-            # 用户真的改了 → 应识别为定制
-            (up / 'docker-compose.yml').write_text(
-                m._port_converged(head) + 'networks:\n  x:\n    external: true\n',
-                encoding='utf-8')
-            with mock.patch.object(m, 'UPSTREAM_DIR', up), \
-                 mock.patch.object(m, 'run', return_value=(0, head)):
-                self.assertTrue(m._compose_looks_customized(self.rep),
-                                '用户的网络定制没被识别出来 —— 更新后会被抹掉')
+    def test_docker_desktop_gateway_stays_loopback(self) -> None:
+        """Docker Desktop 的 192.168.65.0/24 是虚拟机内部地址，宿主不拥有。"""
+        sample = 'services:\n  wb2api:\n    ports:\n      - "7863:7863"\n'
+        env = {'WB2API_BASE': 'http://host.docker.internal:7863',
+               'WB_UPSTREAM_BIND': ''}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(self.mod.socket, 'gethostbyname',
+                                  return_value='192.168.65.254'):
+            out = self.mod._port_converged(sample)
+        self.assertIn('"127.0.0.1:7863:7863"', out,
+                      'Desktop 会转发宿主回环，不应绑虚拟机内部地址')
 
-    def test_customization_restored_after_pull(self) -> None:
-        """端到端：更新流程里先留存、后被 git reset 抹掉、最后原样写回。"""
+    def test_service_name_keeps_loopback(self) -> None:
+        """同网络用服务名直连时，端口只留给宿主调试，回环即可。"""
+        sample = 'services:\n  wb2api:\n    ports:\n      - "7863:7863"\n'
+        env = {'WB2API_BASE': 'http://workbuddy2api:7863',
+               'WB_UPSTREAM_BIND': ''}
+        with mock.patch.dict(os.environ, env, clear=False):
+            out = self.mod._port_converged(sample)
+        self.assertIn('"127.0.0.1:7863:7863"', out)
+
+    def test_explicit_bind_override(self) -> None:
+        sample = 'services:\n  wb2api:\n    ports:\n      - "7863:7863"\n'
+        with mock.patch.dict(os.environ, {'WB_UPSTREAM_BIND': '192.168.1.10'},
+                             clear=False):
+            out = self.mod._port_converged(sample)
+        self.assertIn('"192.168.1.10:7863:7863"', out,
+                      'WB_UPSTREAM_BIND 应能覆盖自动判定')
+
+    def test_bundled_sync_preserves_custom_compose(self) -> None:
+        """随包同步只更新源码，用户对 compose 的网络/卷定制要原样保留。"""
         m = self.mod
         custom = (
             'services:\n'
@@ -413,45 +435,26 @@ class ComposeLocalCustomizationTest(unittest.TestCase):
             '    external: true\n'
         )
         with tempfile.TemporaryDirectory() as td:
-            up = Path(td)
-            (up / '.git').mkdir()
-            compose = up / 'docker-compose.yml'
+            root = Path(td)
+            src = root / 'pkg'
+            dst = root / 'upstream'
+            src.mkdir()
+            dst.mkdir()
+            (src / 'docker-compose.yml').write_text(
+                'services:\n  wb2api:\n    ports:\n      - "7863:7863"\n',
+                encoding='utf-8')
+            (src / 'Dockerfile').write_text('FROM scratch\n', encoding='utf-8')
+            compose = dst / 'docker-compose.yml'
             compose.write_text(custom, encoding='utf-8')
-            rep = _Rep()
 
-            def fake_run(cmd, cwd=None, rep=None, check=True, **kw):
-                if cmd[:2] == ['git', 'status']:
-                    return 0, ' M docker-compose.yml\n'
-                if cmd[:2] == ['git', 'diff']:
-                    return 0, 'diff...'
-                if cmd[:2] == ['git', 'rev-parse']:
-                    return 0, 'abc12345'
-                if cmd[:3] == ['git', 'checkout', '--']:
-                    # 模拟丢弃本地改动
-                    compose.write_text('services:\n  wb2api:\n    ports:\n      - "7863:7863"\n',
-                                       encoding='utf-8')
-                    return 0, ''
-                if cmd[:2] == ['git', 'fetch'] or cmd[:2] == ['git', 'pull'] or cmd[:2] == ['git', 'reset']:
-                    return 0, ''
-                if cmd[:2] == ['docker', 'compose']:
-                    return 0, 'ok'
-                return 0, ''
+            with mock.patch.object(m, 'UPSTREAM_DIR', dst):
+                changed = m._sync_bundled_upstream(src, self.rep)
 
-            with mock.patch.object(m, 'UPSTREAM_DIR', up), \
-                 mock.patch.object(m, 'DATA_DIR', up), \
-                 mock.patch.object(m, 'run', side_effect=fake_run), \
-                 mock.patch.object(m, '_compose_looks_customized', return_value=True), \
-                 mock.patch.object(m, '_missing_copy_sources', return_value=[]), \
-                 mock.patch.object(m, '_has_compose_v2', return_value=True), \
-                 mock.patch.object(m, 'wait_health', return_value=True), \
-                 mock.patch.object(m, '_clear_version_cache'):
-                m.update_upstream(rep)
-
+            self.assertGreater(changed, 0)
             text = compose.read_text(encoding='utf-8')
             self.assertIn('1panel-network', text, '用户的网络定制在更新后丢了')
             self.assertIn('external: true', text, 'external 声明在更新后丢了')
-            self.assertIn('127.0.0.1:7863:7863', text, '端口收敛没重新施加')
-            self.assertNotIn('"7863:7863"', text, '公网绑定残留')
+            self.assertIn('127.0.0.1:7863:7863', text, '端口收敛没保留')
 
 
 class DbOpenFailureMessageTest(unittest.TestCase):
@@ -684,6 +687,112 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertTrue(any('docker.sock' in v for v in vols),
                         '未挂 docker.sock —— 容器版将无法重载/更新上游')
 
+    def test_env_file_actually_reaches_both_deployments(self) -> None:
+        """`.env` 里的可选项（出口代理等）必须真能到达进程。
+
+        事实核查过：Windows 原生由 uvicorn 的 --env-file 读 .env；而 compose 只透传
+        environment: 列表、systemd 只认 Environment= 行 —— 两处都**不读** .env，
+        于是「写进 .env」在容器与 systemd 部署里静默失效（配了代理却像没配）。
+        这里钉住接线：compose 要把这几个变量取过来，systemd 单元要读那个文件。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        env = dc['services']['workbuddy-manager']['environment']
+        for key in ('WB_HTTP_PROXY', 'WB_UPDATE_PROXY', 'WB_DEFAULT_ACCOUNT_PROXY'):
+            with self.subTest(key=key):
+                self.assertIn(key, env, f'compose 没把 {key} 透传进来 —— 写进 .env 也没用')
+                self.assertIn('${' + key, str(env[key]),
+                              f'{key} 没从 .env 取值（compose 用 ${{VAR:-}} 取）')
+        unit = (_ROOT / 'deploy' / 'workbuddy-web.service').read_text(encoding='utf-8')
+        self.assertIn('EnvironmentFile=-/opt/workbuddy-manager/.env', unit,
+                      'systemd 单元没读 .env —— 那里面配的代理/线路不会生效')
+
+    def test_dockerfile_deps_go_to_writable_user_site(self) -> None:
+        """容器内更新要把新依赖装到**可写**的位置（issue #157 的另一半）。
+
+        镜像里依赖是 root 装的，site-packages 归 root；而进程是 uid 10001。
+        更新器改用 `pip install --user` 后，落点由 PYTHONUSERBASE 决定 ——
+        它必须在镜像里钉死并落在被 chown 给 10001 的 /app 下，否则要么装不进去，
+        要么装进去了、重启后的新进程却不在 sys.path 上找它。
+        """
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertIn('PYTHONUSERBASE=/app/.local', df,
+                      '未钉死 PYTHONUSERBASE —— --user 的落点会随 HOME 漂移')
+        # 目录必须先建出来：site.py 只在目录**存在**时才把它加进 sys.path
+        # （不存在就不加，重启后的进程找不到刚装的包）。
+        self.assertRegex(df, r'mkdir -p[^\n]*/app/\.local',
+                         '/app/.local 没在 useradd 那步建出来 —— 装完也不进 sys.path')
+        # 且要被 chown -R 10001:10001 /app 覆盖，否则 uid 10001 写不进去
+        self.assertRegex(df, r'chown -R 10001:10001\s+/app\b',
+                         'chown 未覆盖 /app —— /app/.local 归属不对，装不进去')
+
+
+class DockerSocketPreflightTest(unittest.TestCase):
+    """容器里用不了 docker.sock 时，必须给出**可照做**的修法。
+
+    挂上 /var/run/docker.sock 只是必要条件：socket 在宿主上通常归 root:docker
+    （gid 998/999），而容器里的进程是 uid 10001 —— 不在那个组里就是 EACCES。
+    默认 compose 里一个 group_add 都没有，所以这条路径在真机上必失败，
+    而原来只会得到一句「权限不足，请确认以 root 或具备 docker 权限的用户执行」，
+    容器里没有 root 可变，用户无从下手。
+    """
+
+    def test_compose_group_add_uses_env_gid(self) -> None:
+        """compose 要能用宿主**真实的** docker 组 GID 给容器补组。"""
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        svc = dc['services']['workbuddy-manager']
+        groups = [str(g) for g in (svc.get('group_add') or [])]
+        self.assertTrue(groups,
+                        '没配 group_add —— 容器内 uid 10001 用不了挂进来的 docker.sock')
+        self.assertTrue(any('DOCKER_GID' in g for g in groups),
+                        f'group_add 没用 DOCKER_GID 变量：{groups}（宿主 GID 因机器而异，写死必错）')
+        env = (_ROOT / '.env.example').read_text(encoding='utf-8')
+        self.assertIn('DOCKER_GID', env, '.env.example 没说明 DOCKER_GID 怎么取')
+        self.assertIn('stat -c', env,
+                      '要给出取 GID 的命令：stat -c %g /var/run/docker.sock')
+
+    def test_diagnose_permission_denied_gives_socket_recipe(self) -> None:
+        """socket 连不上的权限错误要指向 group_add，而不是"请用 root 执行"。"""
+        mod = _load_update_mod()
+        hint = mod._diagnose_build_failure(
+            'permission denied while trying to connect to the Docker daemon socket '
+            'at unix:///var/run/docker.sock')
+        self.assertIn('group_add', hint, f'socket 权限错误没指向 group_add：{hint!r}')
+        self.assertIn('DOCKER_GID', hint)
+        # 与 socket 无关的权限问题仍给原来的提示（两件事不能混为一谈）
+        other = mod._diagnose_build_failure('mkdir /opt/workbuddy2api: permission denied')
+        self.assertIn('权限', other)
+        self.assertNotIn('group_add', other)
+
+    def test_docker_unusable_hint_is_actionable(self) -> None:
+        """docker 连不上时给出的提示必须可照做（容器形态：指向 group_add）。"""
+        mod = _load_update_mod(WB_RUN_MODE='docker')
+        with mock.patch.object(mod.subprocess, 'run',
+                               side_effect=FileNotFoundError('docker')):
+            hint = mod._docker_unusable_hint()
+        self.assertIn('DOCKER_GID', hint)
+        self.assertIn('group_add', hint)
+
+    def test_docker_usable_hint_is_empty(self) -> None:
+        """能用 docker 时不该有任何提示（否则每次更新都刷一段无关的告警）。"""
+        mod = _load_update_mod()
+        with mock.patch.object(mod.subprocess, 'run',
+                               return_value=mock.Mock(returncode=0)):
+            self.assertEqual(mod._docker_unusable_hint(), '')
+
+    def test_rebuild_upstream_skips_when_docker_unusable(self) -> None:
+        """docker 用不了时跳过上游、**不抛错**。
+
+        抛错会让 `--target both` 整体失败 —— 上游的问题不该把管理端也拖死，
+        而管理端才是用户唯一能操作的面板。
+        """
+        mod = _load_update_mod()
+        rep = _Rep()
+        with mock.patch.object(mod, '_docker_unusable_hint', return_value='提示正文'):
+            mod.rebuild_upstream(rep)  # 不应抛
+        self.assertIn('提示正文', rep.text())
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -832,6 +941,79 @@ class MultiArchImageTest(unittest.TestCase):
         self.assertIn('exit 1', df, '不支持的架构应直接失败')
 
 
+class UpstreamImagePublishTest(unittest.TestCase):
+    """上游也要发预构建镜像（issue #241）。
+
+    用户要跑多个上游容器做分组时，此前只能自己 build：先拉 golang 基础镜像、
+    再编译 6 个二进制；国内网络常常卡在拉基础镜像那一步。于是有人拿第三方镜像
+    顶上，面板随即提示「与项目上游源码不一致」—— 版本漂移的根源不是用户乱来，
+    而是官方没给可拉的东西。
+
+    这里锁住三条：镜像必须**用发布包里那份源码**构建（= 资产 + 全部补丁，
+    与面板随包上游同源，否则又制造一次漂移）、必须多架构、取不到上游源码时
+    不能把发版带红。
+    """
+
+    def setUp(self) -> None:
+        self.wf = (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
+
+    def _step(self, name: str) -> str:
+        start = self.wf.find('- name: ' + name)
+        self.assertGreater(start, 0, f'找不到步骤：{name}')
+        end = self.wf.find('- name:', start + 10)
+        return self.wf[start:end if end > 0 else len(self.wf)]
+
+    def test_builds_from_the_bundled_upstream(self) -> None:
+        block = self._step('构建并推送上游镜像')
+        self.assertIn('${{ steps.pack.outputs.stage }}/upstream', block,
+                      '上游镜像必须用发布包里那份源码构建，否则会与面板随包上游漂移')
+        self.assertIn('workbuddy2api', self.wf, '镜像名里没有上游项目名')
+
+    def test_upstream_image_is_multi_arch(self) -> None:
+        block = self._step('构建并推送上游镜像')
+        self.assertIn('linux/amd64', block)
+        self.assertIn('linux/arm64', block,
+                      '上游镜像也要 arm64 —— 否则 ARM 主机仍然只能自己 build')
+
+    def test_missing_upstream_does_not_break_release(self) -> None:
+        block = self._step('构建并推送上游镜像')
+        self.assertIn("steps.pack.outputs.has_upstream == '1'", block,
+                      '取不到上游源码时应跳过，不能让发版失败')
+        self.assertIn('continue-on-error: true', block,
+                      '镜像推不上去不该让发布作业标红')
+
+    def test_upstream_image_carries_version_and_upstream_id_labels(self) -> None:
+        """镜像必须自带版本与上游标识 label。
+
+        镜像部署（compose 用 image: 不用 build:）下，本机磁盘没有源码目录，
+        .upstream-id 文件不存在，面板会把「随包上游与本机不一致」永远挂在
+        界面上。镜像有了自描述 label，面板读容器镜像的 labels 就能判断
+        「镜像部署且与本次发布同源」。label 一丢，这条判定路径就断了。
+        """
+        block = self._step('构建并推送上游镜像')
+        self.assertIn('org.opencontainers.image.version=', block,
+                      '上游镜像缺少版本 label，镜像部署无法自报版本')
+        self.assertIn('dev.workbuddy.upstream-id=${{ steps.pack.outputs.upstream_id }}',
+                      block, '上游镜像缺少 upstream-id label，面板无法判定镜像与发布同源')
+        pack = self._step('组装发布目录')
+        self.assertIn('echo "upstream_id=$UPSTREAM_ID" >> $GITHUB_OUTPUT', pack,
+                      'pack 步骤没有产出 upstream_id，镜像 label 会渲染成空串')
+
+
+class UpdaterBootstrapPackagingTest(unittest.TestCase):
+    """发布包必须把更新器放一份到 server/（issue #240）。
+
+    旧安装的根目录 `deploy/update.py` 可能不支持随包同步；它不会替换自己，
+    只靠根目录那份会让「随包上游与本机不一致」永远消不掉。server/ 每次更新
+    都会被整体替换，因此包内 `server/deploy/update.py` 是更新器的自举入口。
+    """
+
+    def test_release_stage_copies_updater_into_server(self) -> None:
+        wf = (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
+        self.assertIn('cp deploy/update.py "$STAGE/server/deploy/update.py"', wf,
+                      '发布包没有把更新器放进 server/，旧部署的更新器永远换不掉')
+
+
 # 模板**随仓库分发**（PR #58）：用户 fork 之后把它复制进自己 fork 的
 # `.github/workflows/` 才会生效。这里直接测模板本身，而不是等它在
 # `.github/workflows/build-image.yml` 下出现 —— 后者在本仓库永远不会出现
@@ -935,32 +1117,25 @@ class UpstreamSourceFallbackTest(unittest.TestCase):
         self.assertIn('pwd -P', self.sh, '没有做「同一目录」判断')
 
     def test_bundled_upstream_is_preferred_and_ordered_first(self) -> None:
-        """发布包自带 `upstream/` 时优先用它，且顺序必须在 git/克隆之前。
+        """发布包自带 `upstream/` 时优先用它，顺序在「已有源码」之前。
 
-        上游源码随 Release 包分发（公开仓库不放上游代码），所以「包里有就用包里
-        的」是**新用户第一次安装**会走的路。顺序错了（比如先试 git clone）会让
-        离线机器白等一次超时，最后还可能失败。
+        上游已由本项目维护，Release 包是唯一官方来源；脚本不再从外部 git
+        克隆。包里有源码就直接用，离线机器也不会白等一次网络超时。
         """
         self.assertIn('UPSTREAM_DIR}/docker-compose.yml', self.sh,
                       '没有检测发布包自带的 upstream/')
         i_bundled = self.sh.index('BUNDLED=')
-        # 用**安装分支里**那个 elif 作锚点：脚本开头还有一处 [ -d .../.git ] 属于
-        # 「已装过上游，只需确保容器在跑」的分支，拿它比会得到错误的先后（试过）。
-        i_git = self.sh.index('elif [ -d "${UPSTREAM_DIR}/.git" ]')
-        self.assertLess(i_bundled, i_git,
-                        '包内自带的源码要排在「已有 git 目录」之前判断')
-        # 检测到之后必须真的接上：赋给 UPSTREAM_SRC（后面复制/解压那段用的就是它）
+        i_existing = self.sh.index('elif [ -f "${UPSTREAM_DIR}/docker-compose.yml" ]')
+        self.assertLess(i_bundled, i_existing,
+                        '包内自带的源码要排在「目标目录已有源码」之前判断')
         self.assertIn('UPSTREAM_SRC="$BUNDLED"', self.sh,
                       '检测到了包内源码却没接到 UPSTREAM_SRC —— 等于没检测')
 
     def test_release_workflow_embeds_upstream_source(self) -> None:
-        """发布流程要把上游源码塞进包里，且**取不到时不阻断发布**。
+        """发布流程必须把上游源码塞进包里，取不到时直接失败。
 
-        上游源码不放进本仓库，所以「随包分发」是用户拿到源码
-        的唯一常规渠道。两步都不能少：
-          · 从固定的载体 Release 取（tag upstream-src，标 pre-release 才行——
-            否则它会成为 releases/latest，把面板的更新检查带偏）；
-          · 取不到只记 warning 继续打包（否则一次网络抖动就让整个发布失败）。
+        上游已由本项目维护，管理端 Release 是唯一更新源；缺 upstream/ 或
+        `.upstream-id` 的包不能发出去。
         """
         import yaml
         wf = (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
@@ -968,13 +1143,16 @@ class UpstreamSourceFallbackTest(unittest.TestCase):
         self.assertIn('releases/download/upstream-src/workbuddy2api-src.tar.gz', wf,
                       '没有从载体 Release 取上游源码')
         self.assertIn("$STAGE/upstream", wf, '取回来的源码没有放进发布目录')
-        self.assertIn('::warning::', wf, '取不到源码时会直接失败 —— 应该只告警')
+        self.assertIn('::error::', wf, '取不到源码时应让发布失败')
+        self.assertIn('.upstream-id', wf, '没有校验包内 upstream-id')
 
-    def test_clone_failure_lists_ways_out(self) -> None:
-        """克隆失败要把三条退路写清楚——否则用户只看到 git 的 not found。"""
-        block = self.sh[self.sh.find('克隆上游仓库失败'):]
+    def test_no_external_git_clone_left(self) -> None:
+        """安装脚本不应再访问外部上游仓库。"""
+        self.assertNotIn('UPSTREAM_REPO', self.sh)
+        self.assertNotIn('git clone', self.sh)
+        block = self.sh[self.sh.find('发布包里没有 upstream/'):]
         block = block[:block.find('fi\n') + 3]
-        for hint in ('UPSTREAM_SRC=', 'UPSTREAM_REPO=', '--skip-upstream'):
+        for hint in ('UPSTREAM_SRC=', '--skip-upstream'):
             self.assertIn(hint, block, f'失败提示里缺 {hint}')
 
     def test_tar_strips_top_level_directory(self) -> None:

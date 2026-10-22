@@ -7,6 +7,11 @@ export interface Me {
 
 export interface Account {
   proxy?: string;
+  /**
+   * 手写权重（issue #187）：上游选号的**乘数**，默认 1；0 = 未设置（等价 1）。
+   * 写在上游 auth 文件顶层 `weight` 里 —— 上游刷新 token 时会保留它。
+   */
+  weight?: number;
   /** 该令牌签发的总时长（秒）；后端从 JWT 解出，解不出为 null */
   ttl_seconds?: number | null;
   /** 令牌签发时间（秒）≈ 最近一次刷新时间；后端从 JWT iat 解出，解不出为 null */
@@ -141,6 +146,47 @@ export interface AccountsResponse {
   manageable?: boolean;
 }
 
+/**
+ * 令牌刷新计划（计划任务）：每 `interval_days` 天的 `hour` 整点，全量刷新一次
+ * 所有账号的 accessToken。与「快过期才续期」的自动续期是并列的两条路径。
+ *
+ * `last_run` / `next_run` 都是 epoch 秒；`last_run=0` = 从未跑过，
+ * `next_run=null` = 计划未启用。
+ */
+export interface RefreshPlan {
+  enabled: boolean;
+  interval_days: number;
+  hour: number;
+  last_run: number;
+  next_run: number | null;
+}
+
+/** 每日任务计划里的单个任务（签到 / 领取补偿 / 领奖 / 做任务） */
+export interface DailyTaskConfig {
+  enabled: boolean;
+  /** 0-23 整点 */
+  hour: number;
+  /** 本小时是否已跑（`YYYY-MM-DD-HH`；空串 = 从未） */
+  last_run: string;
+}
+
+export type DailyTask = 'checkin' | 'compensation' | 'claim' | 'full';
+
+/**
+ * 每日任务计划（`/api/accounts/daily-plan`）。
+ *
+ * 与「令牌刷新计划」并列，跑的是管理端的「一键」动作。三者安全等级不同：`claim`
+ * 只认领已完成任务的奖励（幂等）、`checkin` 与 `compensation` 幂等，而 `full` 会
+ * **伪造活跃上报**（上游脚本自己都标「慎用」）——所以有写风险的那个默认关，界面对
+ * full 必须带警告。`compensation` 是唯一默认开的：见 dailyplan._DEFAULTS 的说明。
+ */
+export interface DailyPlan {
+  checkin: DailyTaskConfig;
+  compensation: DailyTaskConfig;
+  claim: DailyTaskConfig;
+  full: DailyTaskConfig;
+}
+
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
 export interface PoolCounts {
   total: number;
@@ -168,6 +214,81 @@ export interface UpstreamStatus {
   redis_mode?: string;
   sticky_sessions?: number;
   error?: string;
+}
+
+export interface ProxyRoute {
+  name: string;
+  scheme: string;
+  host: string;
+  port: number | null;
+  has_auth: boolean;
+  masked: string;
+  local?: boolean;
+  /** 绑定账号数（列表接口一定会给） */
+  bound: number;
+  /** 池里的启用开关：停用的线路不会被自动挑选（显式绑定仍会报错提醒） */
+  enabled: boolean;
+  /** 按权重分摊/挑选（越大越常被选中） */
+  weight: number;
+  /** 前几个绑定账号的昵称（列表里显示 chips） */
+  bound_names?: string[];
+  /** 绑了 ≥3 台时的风控提示（同一个出口 IP 上的号容易被上游按 IP 聚类） */
+  shared_warning?: boolean;
+  /** 上次测试的结果（面板里记着） */
+  probe?: {ok: boolean; ms: number; at: number; exit_ip?: string; error?: string} | null;
+}
+
+export interface RouteAccount {
+  file: string;
+  uid: string;
+  nickname: string;
+  /** 绑定的线路名；空 = 跟随池策略 */
+  proxy: string;
+}
+
+export interface ProxyPool {
+  enabled: boolean;
+  strategy: 'priority' | 'round_robin' | 'random' | 'least_connections';
+  interval_seconds: number;
+  strategies: string[];
+  routes_total: number;
+  routes_enabled: number;
+}
+
+export interface RouteBindingsResponse {
+  accounts: RouteAccount[];
+  routes: string[];
+  pool: ProxyPool;
+}
+
+export interface ProxyRouteList {
+  routes: ProxyRoute[];
+  default: string;
+  schemes: string[];
+  bound_total: number;
+  /** 池配置（开关 / 策略 / 间隔） */
+  pool: ProxyPool;
+}
+
+export interface ProxyProbe {
+  ok: boolean;
+  ms: number;
+  exit_ip?: string;
+  exit_info?: string;
+  error?: string;
+}
+
+export interface ProxySettings {
+  http_proxy: string;
+  update_proxy: string;
+  http_configured: boolean;
+  update_configured: boolean;
+  env_http_proxy: string;
+  env_update_proxy: string;
+  effective: string;
+  source: 'panel' | 'env' | 'none' | 'off';
+  probe_url: string;
+  global_proxy_enabled: boolean;
 }
 
 export interface ModelInfo {
@@ -577,6 +698,34 @@ export interface UsageHourPoint {
   failed: number;
 }
 
+/** 一天的积分收入 / 支出（`/api/stats/credits` 的 daily 项） */
+export interface CreditsFlowPoint {
+  day: string;
+  /** 收入：余额增加流水（kind='credit'）当日合计 */
+  income: number;
+  /** 支出：调用实际扣费（usage.credit）当日合计 */
+  expense: number;
+  /** income - expense */
+  net: number;
+}
+
+/**
+ * 积分收支统计。
+ *
+ * 收入与支出是**两套口径**（见后端 `credits_flow` 的说明）：收入是「余额比
+ * 上次查询增加的部分」，按查询时刻归日，属于近似值；支出是每次调用的真实扣费，
+ * 精确到请求。所以界面上必须分开标注，不能只拿「净额」下结论。
+ */
+export interface CreditsFlow {
+  days: number;
+  from: string;
+  to: string;
+  today: {income: number; expense: number; net: number};
+  week: {income: number; expense: number; net: number};
+  total: {income: number; expense: number; net: number};
+  daily: CreditsFlowPoint[];
+}
+
 export interface UsageBreakdown {
   name: string;
   requests: number;
@@ -584,6 +733,13 @@ export interface UsageBreakdown {
   completion_tokens: number;
   /** 该维度实际扣费合计 */
   credit: number;
+  /**
+   * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
+   * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
+   */
+  tokens_per_sec?: number | null;
+  /** 参与速率计算的请求条数（只覆盖日志保留期内的成功请求） */
+  throughput_samples?: number;
 }
 
 export interface StatsSummary {
@@ -649,7 +805,11 @@ export interface IpAccessLog {
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
    * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
-   * rate_limited 等。
+   * rate_limited / key_auth_flood 等。
+   *
+   * `key_auth_flood` 不是「这一条被什么拦了」，而是一条**汇总标记**：同一个 IP
+   * 在一分钟窗口内用无效/缺失密钥刷了太多次，后面的同类记录被折叠，这一行代表
+   * 那批被折叠的请求（后端 `_auth_log_verdict`）。
    *
    * 稳定短码而非散文：展示侧按语言翻译，改文案不必迁移历史数据。
    * 存量记录为 null（那时没记原因），界面显示「未记录」。
@@ -691,6 +851,11 @@ export interface UpstreamConfig {
   listen?: string;
   api_key_masked?: string;
   auth_dir?: string;
+  /**
+   * 思考内容兜底（上游 config.json 的**顶层**键，不在 features 段里）：
+   * 正文为空时把推理原文当正文下发。缺省按上游默认 true 回显。
+   */
+  reasoning_as_content?: boolean;
   /** 上游 config.json 中声明的 auth_dir，与管理端不一致时出现 */
   upstream_auth_dir?: string;
   schedule?: Record<string, unknown>;
@@ -786,6 +951,17 @@ export interface TaskLogResponse {
  *   claim   只领已完成任务的奖励（幂等，不伪造行为）
  *   full    点亮 + 领奖（会伪造活跃上报，有风控风险，需二次确认）
  */
+/** 活动任务的一行摘要（后端 task_summary.summarize 产出，issue #189） */
+export interface TaskRunSummaryItem {
+  /** 上游任务码，如 `Sequential_Tasks_2`；认不出的就原样显示 */
+  code: string;
+  state: 'pending' | 'claimed' | 'skipped' | 'failed';
+  /** 该任务最有代表性的一条原始日志行（未翻译） */
+  line: string;
+  /** 命中该任务的行数（多行时取最需要行动的那条做代表） */
+  count: number;
+}
+
 export interface TaskRunStatus {
   running: boolean;
   mode: string;
@@ -797,6 +973,12 @@ export interface TaskRunStatus {
   error: string;
   /** 输出尾部（脚本按行打印，后端只保留最近若干行） */
   lines: string[];
+  /**
+   * 按任务聚合的摘要（issue #189）：每条 `{code, state, line, count}`。
+   * `line` 是原始日志行（前端按当前语言渲染），`state` 是机器可读枚举。
+   * 后端按「失败 → 待处理 → 已领取 → 跳过」排好序，前端不再重排。
+   */
+  tasks?: TaskRunSummaryItem[];
   /** 本次运行从脚本 stdout 抓到的中奖记录（开学季抽奖） */
   prizes?: {uid: string; label: string; prize_code: string;
             prize_type: string; credit: number}[];
@@ -847,8 +1029,8 @@ export interface UpdateStatus {
   version: string;
   updater_found: boolean;
   upstream_dir: string;
-  /** 当前固定的上游版本（空 = 跟随分支） */
-  upstream_ref?: string;
+  /** 随包上游的稳定标识（空 = 旧部署没有 .upstream-id） */
+  upstream_id?: string;
   started_at?: number;
   finished_at?: number | null;
   duration?: number;
@@ -856,11 +1038,11 @@ export interface UpdateStatus {
   /** 日志原文（便于复制反馈） */
   log_tail?: string;
   /**
-   * 发布包签名校验结果（供应链防护）。
-   * verified = 已验签通过；skipped = 走了 WB_SKIP_SIGNATURE 绕过开关（有风险）；
-   * none 或缺失 = 未执行验签（如旧版本更新器）。
+   * 发布包完整性校验结果。
+   * digest = sha256 与发布页一致；none = 走的回退路径拿不到发布页摘要，
+   * 只打印了本地摘要（如实标注，不假装校验过）；缺失 = 更新器太旧，没这一项。
    */
-  signature?: {status: 'verified' | 'skipped' | 'none'; detail?: string};
+  integrity?: {status: 'digest' | 'none'; digest?: string};
 }
 
 export interface VersionSide {
@@ -872,18 +1054,33 @@ export interface VersionSide {
   has_update: boolean;
   /** 检测失败原因 */
   error: string;
+  /**
+   * 这一侧的值是否来自**上一次**成功检测（本次失败了）。
+   *
+   * 为 true 时界面不能下「已是最新」的结论 —— 那等于把一次 403/网络失败说成
+   * 「确实没有新版本」（issue #204）。
+   */
+  stale?: boolean;
+  /** 旧值的检测时间（秒，配合 stale 显示「下面是 X 时的结果」） */
+  stale_at?: number;
 }
 
 export interface ManagerVersion extends VersionSide {
   /** Release 页面地址 */
   url: string;
   /**
-   * 该 Release 是否已附带签名文件。
+   * 该 Release 的产物（.tar.gz）是否就位。
    *
-   * `false` = 新版本已发布但维护者还没签名（发布后有个窗口期）：这时更新会被
-   * 拒绝，界面要**先说清楚**，别让人点下去才失败。`null` = 未知（旧缓存）。
+   * `false` = 版本可见但产物还没上传（手工建的 Release 会这样）：这时点了更新
+   * 只会拿到 404，界面要**先说清楚**。`null` = 未知（旧缓存）。
    */
-  sig_ready: boolean | null;
+  assets_ready: boolean | null;
+  /** Release 正文（纯文本，截断）；更新前展示，避免装完才知道配套要求 */
+  release_notes?: string;
+  /** Release 发布时间（ISO 字符串） */
+  published_at?: string;
+  /** 本次发布包内的上游与本机不一致（由 Release 正文里的 upstream-id 判断） */
+  upstream_changed?: boolean;
   repo: string;
 }
 
@@ -921,11 +1118,45 @@ export interface UpdateCheck {
   has_any: boolean;
 }
 
+/** 已上传的离线升级包（issue #153）：内网机器用它代替「从 GitHub 拉最新」 */
+export interface UpdatePackageMeta {
+  /** 文件是否还在（记录存在但文件被清掉时为 false） */
+  present: boolean;
+  /** 上传时的原始文件名（只用于显示） */
+  name?: string;
+  /** 文件大小（字节） */
+  size?: number;
+  /** 服务端算出的 sha256 */
+  sha256?: string;
+  /** 用户在界面上填的「发布页 sha256」，空 = 没填、更新时只做结构校验 */
+  expected_sha256?: string;
+  /** 包内 .version（发布包打进包里的版本号） */
+  version?: string;
+  uploaded_at?: number;
+  uploaded_by?: string;
+}
+
 export interface Versions {
   manager: string;
   upstream_connected: boolean;
   upstream_accounts: number | null;
   upstream_dir: string;
+}
+
+/**
+ * GitHub 镜像（issue #216）：国内机器直连 GitHub 超时时，用加速服务取
+ * Release 元信息与发布包。走镜像时**不会**发送 GitHub Token。
+ */
+export interface GithubMirror {
+  /** 生效的镜像基址（规范化后带尾斜杠）；空串 = 直连 */
+  mirror: string;
+  /** 面板里存的值（空 = 没设过） */
+  stored: string;
+  /** 部署时注入的环境变量 WB_GITHUB_MIRROR */
+  env_mirror: string;
+  source: 'panel' | 'env' | '';
+  /** 界面上的快捷选项 */
+  presets: string[];
 }
 
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */

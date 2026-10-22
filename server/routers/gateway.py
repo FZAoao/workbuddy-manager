@@ -1,8 +1,12 @@
 """对外反代网关：密钥鉴权 → IP 管控 → 模型映射 → 转发 → 计量落库。"""
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+from urllib.parse import urlsplit
 import logging
+import threading
 import time
 
 import httpx
@@ -10,6 +14,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
+from ..services import modelcatalog, modelmap, proxyroutes
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -56,26 +61,117 @@ def _bearer(request: Request) -> str:
 # 所以做法是：上限改成**本端自己的**配置（`WB_GATEWAY_MAX_BODY_MB`），默认调到
 # 32 MB —— 足够容纳常见的长上下文与附件，又不会让单进程内存失控。
 #
-# 不读取上游旧版 config.json 中的 server.max_body_mb：它是上游自身的历史设置，
-# 且新版上游已移除对应限制；继续沿用会让旧配置悄悄盖过网关自己的明确上限。
+# 兼容：上游若仍是**旧版**（配置里还有 server.max_body_mb），继续尊重它的取值
+# （见 max_body_bytes），这样升级顺序不受限：先升哪边都不会出现「一边说 256MB
+# 另一边 413」的错配。上限究竟来自哪一侧记在 `_BODY_LIMIT_SOURCE`，413 的文案
+# 据此指路，不让人按错的配置项去调。
+_BODY_LIMIT_TTL = 10
+_body_limit_cache: dict[str, float | int] = {'at': 0.0, 'bytes': 0, 'source': ''}
 DEFAULT_MAX_BODY_MB = _env_int('WB_GATEWAY_MAX_BODY_MB', 32)
+# 上限是**谁**定的：'upstream'（旧版上游 config.json 的 server.max_body_mb）/
+# 'env'（本端 WB_GATEWAY_MAX_BODY_MB）/ ''（默认值）。
+# 为什么要记它：413 的提示必须告诉用户「该去哪改」。issue #180 里用户按旧文案
+# 改了环境变量却毫无效果 —— 因为上限其实来自上游配置，文案指错了地方。
+_BODY_LIMIT_SOURCE: dict[str, str] = {'value': ''}
 
 
 def max_body_bytes() -> int:
     """当前生效的请求体上限（字节）。
 
-    只使用网关自己的 `WB_GATEWAY_MAX_BODY_MB`（默认 32 MB）。
+    本端自己的 `WB_GATEWAY_MAX_BODY_MB`（默认 32 MB）是基准；仅当上游仍是旧版、
+    配置里还留着 `server.max_body_mb` 时才跟随那个值（并按 10 秒缓存，避免每次
+    请求都读一遍配置）。
 
     """
-    return DEFAULT_MAX_BODY_MB * 1024 * 1024
+    now = time.time()
+    cached = int(_body_limit_cache['bytes'])
+    if cached and now - float(_body_limit_cache['at']) < _BODY_LIMIT_TTL:
+        return cached
+    limit = DEFAULT_MAX_BODY_MB * 1024 * 1024
+    source = 'env' if _env_set('WB_GATEWAY_MAX_BODY_MB') else ''
+    try:
+        cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+        mb = int((cfg.get('server') or {}).get('max_body_mb') or 0)
+        if mb > 0:
+            limit = mb * 1024 * 1024
+            source = 'upstream'
+    except Exception:  # noqa: BLE001
+        # 配置读不到就沿用默认值：网关不能因为读不到配置而拒绝服务
+        pass
+    _body_limit_cache['at'] = now
+    _body_limit_cache['bytes'] = limit
+    _body_limit_cache['source'] = source
+    _BODY_LIMIT_SOURCE['value'] = source
+    return limit
+
+
+def _env_set(name: str) -> bool:
+    value = (os.environ.get(name) or '').strip()
+    return value != ''
+
+# ── max_tokens 上限钳制 ────────────────────────────────────────────
+#
+# 上游的 `Request.max_tokens` 是 **int32**（上限 2147483647）。超出后上游拒绝时
+# 不是回 400，而是把它包成 `no_healthy_account` + 503——客户端据此以为「服务暂时
+# 不可用」而重试，但参数越界重试多少次都一样失败。
+#
+# 实测触发来源：有客户端按「剩余额度 → max_tokens」做减法（形如 `1e10 - 已消耗`，
+# 约 99.99 亿，是 int32 上限的 4.66 倍）。这类值是**算出来的**、不是用户填的，
+# 客户端那侧的换算逻辑我们改不到，只能由网关兜住。
+#
+# 阈值取 1e6：上游 /v1/models 里最大的 max_output_tokens 实测为 131072，
+# 1e6 有约 7 倍余量，不会误伤正常请求，又能挡住这类减法式产物。
+MAX_TOKENS_CEILING = 1_000_000
+
+# 一并钳制的字段：三种协议各自的输出上限字段名。
+# `max_completion_tokens` 是 OpenAI 较新的名字（o-series / gpt-5 时代取代
+# `max_tokens`），部分客户端已默认用它；上游同样按 int32 读，实测越界时一样
+# 回 503。网关是透传的，客户端发什么就转发什么，故必须一并兜住。
+_MAX_TOKENS_FIELDS = ('max_tokens', 'max_completion_tokens', 'max_output_tokens')
+
+
+def clamp_max_tokens(body: dict) -> None:
+    """原地钳制请求体里的输出上限字段（见 _MAX_TOKENS_FIELDS）。
+
+    为什么是**原地改**而不是返回新 dict：`_chat` 与两个协议层都是拿到 body 后
+    直接转发，原地把越界值压回上限，调用方无需改动其余逻辑。
+
+    非数字一律**原样保留**（不猜测、不置默认）：把它交回上游去判，网关不替
+    上游做协议决定——历史上替上游兜底过的字段都留下了难以回溯的偏差。
+    """
+    if not isinstance(body, dict):
+        return
+    for field in _MAX_TOKENS_FIELDS:
+        value = body.get(field)
+        # bool 是 int 的子类，必须排除；None 交给上游按「未提供」处理
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value <= MAX_TOKENS_CEILING:
+            continue
+        body[field] = MAX_TOKENS_CEILING
 
 
 def _payload_too_large(limit: int) -> JSONResponse:
+    """413 的正文必须说清「上限是多少、谁定的、该去哪改」。
+
+    issue #180 的教训：以前不管上限从哪来都写「由环境变量 WB_GATEWAY_MAX_BODY_MB
+    决定」—— 而用户的上游是旧版、config.json 里还留着 `server.max_body_mb`，
+    面板**优先**听它，于是用户改了环境变量毫无效果，还以为面板不认这个配置。
+    """
     mb = limit // 1024 // 1024
+    source = _BODY_LIMIT_SOURCE.get('value') or ''
+    if source == 'upstream':
+        where = ('该上限来自**上游** config.json 的 server.max_body_mb（你的上游是旧版、'
+                 '还认这个键；面板优先听它，所以改环境变量不生效）：把那个值调大并重启上游，'
+                 '或者删掉该键，让面板改用环境变量 WB_GATEWAY_MAX_BODY_MB')
+    elif source == 'env':
+        where = ('该上限来自环境变量 WB_GATEWAY_MAX_BODY_MB（改完要重启面板）')
+    else:
+        where = ('当前用的是默认上限；可在 .env 里设 WB_GATEWAY_MAX_BODY_MB 提高'
+                 '（改完要重启面板）')
     return _oai_error(
-        f'请求体超过 {mb} MB 上限：请压缩内容（精简上下文或附件）。'
-        f'该上限由本网关设置（环境变量 WB_GATEWAY_MAX_BODY_MB），'
-        f'上游自 9d1a21b 起已不再限制请求体大小',
+        f'请求体超过 {mb} MB 上限：请压缩内容（精简上下文或附件），或提高上限。'
+        f'{where}。上游自 9d1a21b 起已不再限制请求体大小',
         413, 'invalid_request_error', 'payload_too_large',
     )
 
@@ -153,6 +249,61 @@ def _rate_limited(key: dict) -> tuple[bool, int]:
     return limited, len(hits)
 
 
+# ── 未鉴权入口的入站日志采样 ─────────────────────────────
+# 「没有密钥」「密钥不认识」这两条路径**在校验密钥之前**就写库，任何匿名者都能
+# 触发（`/v1/chat/completions` 与 `/v1/usage` 都是这样）。攻击者只要写个循环
+# 用随机 token 打过来，就能以每请求一行的速度把 `ip_access_logs` 的两万行窗口
+# 顶掉——真正该看的扫描记录反而被自己人（同一个人）挤了出去，外加持续的写盘与
+# 行数清理开销。这是**匿名写放大**，与 `_log_ip` 里清洗/截断防的是同一类问题。
+#
+# 做法：按 (来源 IP, 原因) 做**窗口内计数**，前 N 次照常逐条记录（保留细节：
+# 路径、UA 都不一样，排查时有用），超出的折叠掉，并在本窗口第一次折叠时写一条
+# `key_auth_flood` 汇总行——运维能看到「这个 IP 在这一分钟里刷了更多」，但库里
+# 每分钟最多 N+1 行/IP。折叠不是丢弃信号，而是把「很多条一样的东西」压成一条
+# 仍能看出发生了什么的记录。
+#
+# 只对这两个**未鉴权可达**的原因采样：`ip_blocked` / `rate_limited` / 密钥层
+# 拒绝都要求先拿出一把已知密钥，写放大的成本已经由密钥本身承担，采样反而会
+# 藏掉「某把密钥被反复拒绝」的线索。
+#
+# 计数在进程内存里（与上面的每密钥限流同一口径）：单实例足够；`workers > 1`
+# 时每个进程各自计数，上限按进程数放大——仍然有界，可接受。
+_AUTH_FAIL_REASONS = frozenset({'missing_key', 'invalid_key'})
+_AUTH_LOG_WINDOW = 60
+_AUTH_LOG_PER_WINDOW = max(1, _env_int('WB_AUTH_LOG_PER_MIN', 5))
+# 计数表的硬上限。大量不同来源 IP 在同一个窗口内各打一次时，过期清理
+# 永远不会被触发（每个 state 的计数都停在 1）；必须有一个不依赖计数的上限。
+_AUTH_LOG_MAX_ENTRIES = 8192
+# (ip, reason) -> [窗口起点, 本窗次数, 是否已写过汇总行]
+_auth_log_state: dict[tuple[str, str], list] = {}
+_auth_log_lock = threading.Lock()
+
+
+def _auth_log_verdict(ip: str, reason: str) -> str:
+    """返回 'log'（逐条记录）/ 'flood'（写一条汇总行）/ 'drop'（折叠掉）。"""
+    now = time.time()
+    key = (ip, reason)
+    with _auth_log_lock:
+        state = _auth_log_state.get(key)
+        if not state or now - state[0] >= _AUTH_LOG_WINDOW:
+            state = [now, 0, False]
+            _auth_log_state[key] = state
+        state[1] += 1
+        # 硬上限：大量不同来源 IP 各打一次时，按 state 计数的过期清理永远
+        # 轮不到（每个计数都是 1），字典会无界增长。超过上限就清空重来——
+        # 宁可少采样一小段，也不让外部输入把进程内存撑爆。
+        if len(_auth_log_state) > _AUTH_LOG_MAX_ENTRIES:
+            _auth_log_state.clear()
+            state = [now, 1, False]
+            _auth_log_state[key] = state
+        if state[1] <= _AUTH_LOG_PER_WINDOW:
+            return 'log'
+        if not state[2]:
+            state[2] = True
+            return 'flood'
+        return 'drop'
+
+
 def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
             reason: str | None = None) -> None:
     """记录一次入站访问。**默认只记拦截**，放行不记（见下）。
@@ -184,9 +335,19 @@ def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
         污染事后排查（实测确认）。
       * 写入走 `db.add_ip_access_log`，由它负责行数上限（超出就丢最旧的），
         避免表无限增长直到磁盘写满。
+      * 「没有密钥」「密钥不认识」这两种**匿名可达**的原因再做一层窗口采样
+        （见 `_auth_log_verdict`）：每 IP 每分钟前几条照常记，其余折叠成一条
+        `key_auth_flood`。所以「一次都没记」不会发生，被折叠的那部分仍留了
+        一条能看出「这个 IP 在刷」的记录。
     """
     if not blocked and not config.AUDIT_ALL_ACCESS:
         return
+    if reason and reason in _AUTH_FAIL_REASONS:
+        verdict = _auth_log_verdict(ip, reason)
+        if verdict == 'drop':
+            return
+        if verdict == 'flood':
+            reason = 'key_auth_flood'
     db.add_ip_access_log(ip, path, blocked, ua, reason)
 
 
@@ -427,18 +588,18 @@ def _key_reject_code(reason: object, is_model_list: bool) -> str:
 
 
 def _map_model(model: str | None) -> str | None:
-    """「模型映射」查表：别名 → 真名；没有映射时原样返回。
+    """「模型映射」查表：别名 → 真名；没命中就落到**兜底模型**（issue #173），
+    两者都没有时原样返回。
 
     设置坏掉（存成了非对象）时按「没有映射」处理，**不能让整个网关 5xx**：
     映射是可选的便利功能，坏数据只该影响它自己那一项，不连坐（与
     `db._json_list` 对非法 JSON 列的处理同一原则）。
+
+    语义集中在 `services/modelmap`，这里只取结果：白名单补条目与别名校验走同一份
+    实现 —— 三处各写一遍必然漂移，而漂移出来的错位（能调用、但客户端的模型清单里
+    没有它）只有用户能发现。
     """
-    if not model:
-        return model
-    mapping = db.get_setting('model_map', {}) or {}
-    if not isinstance(mapping, dict):
-        return model
-    return mapping.get(model, model)
+    return modelmap.target_for(db.get_setting('model_map', {}) or {}, model)
 
 
 def _upstream_headers(upstream: dict | None = None) -> dict:
@@ -459,6 +620,38 @@ def _upstream_headers(upstream: dict | None = None) -> dict:
     return headers
 
 
+def _upstream_hint(upstream: dict | None) -> str:
+    """502/503 时补一句「本次打的是哪个上游、这一跳会不会走出口代理」。
+
+    为什么要有（issue #167：两位用户都报「直接 curl 上游是通的、经面板全 502」）：
+    原来的报错只有异常文本，看不出面板往哪打的、中间有没有代理。而最常见的两种成因
+    恰恰要靠这两条信息才能自查：
+
+      · 上游地址 / 端口填错（面板打的是配置里那个地址，不是你以为的那个）；
+      · **上游地址写成公网域名、同时又配了出口代理**：面板→上游这一跳会走代理，
+        代理绕不回你自己那台机器，于是全 502 —— 而内网与本机地址是自动直连的。
+
+    `_is_internal_host` 与转发用的判断是同一个函数，所以这里说的「会走代理」就是
+    真实行为，不是提示语里另算一套。
+    """
+    up = upstream or upstreamsvc.default_upstream()
+    base = str(up.get('base_url') or '').strip()
+    if not base:
+        return ''
+    try:
+        host = urlsplit(base).hostname
+    except ValueError:
+        host = None
+    proxy = config.effective_http_proxy()
+    if proxy and host:
+        if config._is_internal_host(host):       # noqa: SLF001 —— 与转发判断同一份实现
+            return f'（本次请求的上游：{base}；该地址属内网/本机，这一跳直连）'
+        masked = proxyroutes.mask_url(proxy)
+        return (f'（本次请求的上游：{base}；这一跳会经出口代理 {masked} —— '
+                f'代理到不了这个地址就会 502）')
+    return f'（本次请求的上游：{base}）'
+
+
 def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
                   ua: str | None) -> tuple[dict | None, JSONResponse | None]:
     """按密钥解析本次请求该走哪个上游；不可用时返回**明确报错**。
@@ -471,6 +664,9 @@ def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
         return upstreamsvc.resolve_for_key(key), None
     except upstreamsvc.UpstreamUnavailable as exc:
         _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False)
+        # 这里不加 _upstream_hint：本函数讲的是「密钥绑定的上游不可用」，作用域里
+        # 也没有那个上游对象 —— 报出默认上游的地址只会把人带偏（异常文本已经说清
+        # 是哪个分组、该启用还是改绑）。
         return None, _oai_error(str(exc), 503, 'api_error', 'upstream_unavailable')
 
 
@@ -511,6 +707,66 @@ def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
     return pending, saw_content
 
 
+# ── 密钥自查用量（issue #137）─────────────────────────────
+# 拿密钥自身鉴权、只回这把密钥自己的数字，**只读面板已记录的值、不触发任何上游请求**
+# （否则「查一下还剩多少」会变成一次真实调用，反过来加剧额度消耗与限流）。
+#
+# 有意**不套用**调用时的那套校验（额度用尽 / 已过期 / 被停用 / IP 白名单）：恰恰是
+# 在调不动的时候，用户最需要看到「还剩多少、为什么调不动」。密钥本身已证明归属，
+# 这里只暴露它自己的元数据，把状态如实回给调用方，而不是再甩一个 401。
+@router.get('/v1/usage')
+def key_usage(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    token = _bearer(request)
+    # 认不出调用方的访问仍要进**入站日志**：这条路径与其它网关入口一样是
+    # 未鉴权可达的，漏记会让「谁在扫我」少一块（安全审计口径，见 `_log_ip`）。
+    if not token:
+        _log_ip(ip, path, True, ua, 'missing_key')
+        return _oai_error('缺少 API Key，请在 Authorization 头中提供 Bearer 令牌',
+                          401, 'authentication_error', 'missing_api_key')
+    key = keysvc.resolve(token)
+    if not key:
+        _log_ip(ip, path, True, ua, 'invalid_key')
+        return _oai_error('API Key 无效', 401, 'authentication_error', 'invalid_api_key')
+
+    def allowance(limit: int | None, used: int | None) -> dict:
+        used_n = int(used or 0)
+        limit_n = int(limit or 0)
+        return {
+            'used': used_n,
+            'limit': limit_n or None,          # None = 不限制
+            'remaining': max(0, limit_n - used_n) if limit_n else None,
+        }
+
+    now = int(time.time())
+    expires_at = int(key.get('expires_at') or 0)
+    # 记一行**请求日志**（与 `/v1/models` 同口径，0 token）：否则一把密钥被
+    # 监控脚本每分钟轮询查用量时，运维在「请求日志」里完全看不出流量从哪来。
+    # 这一行经 `_record` 顺带把「最近使用」与「来源 IP」留痕——与模型列表页、
+    # 面板 API 令牌一致；但 token / 积分消耗**一分不记**（记账口径只认真实调用）。
+    _record(key, ip, '', '', 200, 0, 0, 0, ua, None, False)
+    return {
+        'object': 'key.usage',
+        'key': {
+            'name': key.get('name') or '',
+            'prefix': key.get('prefix') or '',
+            'realm': key.get('realm') or '',
+            'enabled': bool(key.get('enabled')),
+            'expires_at': expires_at,
+            'expired': bool(expires_at and now >= expires_at),
+            'models': list(key.get('models') or []),
+        },
+        'tokens': allowance(key.get('quota'), key.get('used_tokens')),
+        'credits': allowance(key.get('quota_credit'), key.get('used_credit')),
+        'last_used_at': int(key.get('last_used_at') or 0),
+        # 这几个数字是面板**已记录**的值，读取时刻即 snapshot_at；不是向上游现问的。
+        'snapshot_at': now,
+        'data_source': 'panel-recorded',
+    }
+
+
 # ── 模型列表 ─────────────────────────────────────────────
 # 列表按密钥的版本归属过滤：国际版密钥只看到 `global:` 条目、国内版密钥只看到
 # 其余条目（限定了版本的密钥看不到另一版本，免得挑出一个注定 403 的模型）。
@@ -534,6 +790,13 @@ async def list_models(request: Request):
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
         payload = _scope_models(resp.json(), key)
+        # 目录收缩（issue #239）：上游模型表可能仍列着腾讯已经下架的 id，
+        # 客户端选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，
+        # 取得到且来源是腾讯时按它裁一次；取不到就原样透传。
+        payload = await _drop_models_outside_catalog(payload, key)
+        # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
+        # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
+        payload = _listing_compat_models(payload)
         # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
         if request.headers.get('anthropic-version'):
             payload = _as_anthropic_models(payload)
@@ -541,7 +804,7 @@ async def list_models(request: Request):
     except Exception as exc:  # noqa: BLE001
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', 502, 0, 0, latency, request.headers.get('user-agent'), str(exc), False)
-        return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
 
 def _as_anthropic_models(payload: object) -> object:
@@ -592,6 +855,10 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
 
     条目取别名所指模型的信息，只把 `id` 换成别名——**那才是客户端要发的名字**
     （发清单里的真名会被白名单拒掉）。
+
+    解析走 `modelmap.target_for`（含兜底，issue #173）：配了兜底模型之后，白名单里
+    任意名字**都调得通**，那就不该只在没有兜底时补条目 —— 否则客户端拿到的清单里
+    缺了那个名字，用户会以为"白名单没生效"，而其实是清单没列。
     """
     mapping = db.get_setting('model_map', {}) or {}
     if not isinstance(mapping, dict) or not mapping:
@@ -607,13 +874,83 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
         # 本身就是清单里的模型 → 上面的白名单裁剪已保留它，不重复添加
         if not name or name in seen or name in by_bare:
             continue
-        target = mapping.get(name)
+        target = modelmap.target_for(mapping, name)
         src = by_bare.get(keysvc._bare_model(target)) if target else None
         if not src:
             continue          # 别名指向的模型不在本版本清单里 → 调不通，不给
         out.append({**src, 'id': name})
         seen.add(name)
     return out
+
+
+def _catalog_model_key(model: object) -> str:
+    """模型名的跨源比对键：去掉 `cn:` / `global:` 前缀。
+
+    两个来源的前缀口径不同：上游清单国际版带 `global:`，模型中心直连腾讯
+    给的是裸名。同一把密钥只看一个版本，所以去掉前缀比对不会把两版同名
+    模型混在一起（版本维度由 `_model_realm_of` 先筛过）。
+    """
+    raw = keysvc._bare_model(model)
+    return raw[7:] if raw.lower().startswith('global:') else raw
+
+
+def _filter_catalog_models(payload: object, key: dict | None,
+                           realm: str, catalog_ids: set[str]) -> object:
+    """按模型中心的实时目录裁掉已下架的 id（issue #239）。
+
+    上游 `/v1/models` 的表里仍留着腾讯已经收缩掉的旧模型；下游把它当选择器，
+    选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，取得到时以它
+    为准。白名单里的**别名**要继续保留（它指向的模型仍在目录里）。
+    """
+    if not isinstance(payload, dict) or not catalog_ids:
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    key = key or {}
+    mapping = db.get_setting('model_map', {}) or {}
+    aliases: set[str] = set()
+    for raw in key.get('models') or []:
+        name = keysvc._bare_model(raw)
+        target = modelmap.target_for(mapping, name)
+        if target and _catalog_model_key(target) in catalog_ids:
+            aliases.add(_catalog_model_key(name))
+    kept: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            kept.append(m)
+            continue
+        if _model_realm_of(m) != realm:
+            kept.append(m)
+            continue
+        mid = _catalog_model_key(m.get('id'))
+        if mid in catalog_ids or mid in aliases:
+            kept.append(m)
+    return {**payload, 'data': kept}
+
+
+async def _drop_models_outside_catalog(payload: object, key: dict | None) -> object:
+    """取该版本的模型中心目录并裁掉已下架模型；取不到就原样返回。
+
+    目录走 `modelcatalog.catalog()`（5 分钟缓存，来源可能是直连腾讯，也可能
+    是上游回退）。**只有来源是腾讯时才裁**：上游回退本身就是同一份旧表，
+    拿它裁等于没裁。超时/异常一律放弃裁剪，不能因为目录取不到就把列表清空。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    realm = keysvc._norm_realm((key or {}).get('realm'))
+    if realm not in ('cn', 'global'):
+        return payload
+    try:
+        cat = await asyncio.wait_for(modelcatalog.catalog(realm), timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug('模型目录裁剪跳过：%s', exc)
+        return payload
+    if cat.get('source') != 'tencent':
+        return payload
+    ids = {_catalog_model_key(m.get('id')) for m in (cat.get('models') or [])
+           if isinstance(m, dict) and m.get('id')}
+    return _filter_catalog_models(payload, key, realm, ids)
 
 
 def _scope_models(payload: object, key: dict | None) -> object:
@@ -652,6 +989,51 @@ def _scope_models(payload: object, key: dict | None) -> object:
     return {**payload, 'data': scoped}
 
 
+def _listing_compat_models(payload: object) -> object:
+    """补齐第三方模型目录客户端要读的能力字段（issue #211）。
+
+    上游从 #156 起在它自己的 `/v1/models` 里补了 `modalities` /
+    `supported_reasoning_levels`。但面板是**独立进程**，随包分发的上游可能比面板
+    旧（补丁只打在上游），于是下游经面板拿到的清单仍缺字段 —— 报告人的 Magpie
+    就是这样整条跳过模型、看不到多模态与推理档位的。
+
+    这里在面板侧再补一遍，口径与上游的 `addListingCompat` 一致，且**只增不改**：
+
+      · `modalities`：缺字段时补 `{"input": ["text"] + (["image"] if
+        supports_images)}`。文本是所有模型都有的能力；缺整个字段会让客户端
+        直接跳过（这正是 #211 的现场）；
+      · `supported_reasoning_levels`：缺字段且有 `reasoning_supported_efforts`
+        时派生成 `[{"effort": e}]`；没有档位就不编造；
+      · `supports_reasoning`：有档位而字段缺失时补 `true`。
+
+    认不出的结构（不是 `{data:[...]}`）原样透传 —— 不在看不懂的响应上动手脚。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            out.append(m)
+            continue
+        entry = dict(m)
+        if 'modalities' not in entry:
+            inputs = ['text']
+            if entry.get('supports_images') is True:
+                inputs.append('image')
+            entry['modalities'] = {'input': inputs}
+        efforts = entry.get('reasoning_supported_efforts')
+        if 'supported_reasoning_levels' not in entry and isinstance(efforts, list):
+            levels = [{'effort': e} for e in efforts if isinstance(e, str) and e]
+            if levels:
+                entry['supported_reasoning_levels'] = levels
+                entry.setdefault('supports_reasoning', True)
+        out.append(entry)
+    return {**payload, 'data': out}
+
+
 # ── 对话补全（v1 / v2）──────────────────────────────────
 async def _chat(request: Request, upstream_path: str):
     body, err = await _read_json_body(request)
@@ -673,6 +1055,10 @@ async def _chat(request: Request, upstream_path: str):
 
     if mapped:
         body['model'] = mapped
+
+    # 越界的 max_tokens 会被上游包装成 503（见 clamp_max_tokens 的说明），
+    # 鉴权后、转发前压回上限。
+    clamp_max_tokens(body)
 
     stream = bool(isinstance(body, dict) and body.get('stream'))
     if stream:
@@ -713,7 +1099,7 @@ async def _chat(request: Request, upstream_path: str):
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
-            return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+            return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
@@ -724,7 +1110,7 @@ async def _chat(request: Request, upstream_path: str):
         await client.aclose()
         latency = int((time.time() - started) * 1000)
         _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True)
-        return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code
     content_type = resp.headers.get('content-type', 'text/event-stream')

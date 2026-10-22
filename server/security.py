@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import time
+from pathlib import Path
 
 from fastapi import Depends, HTTPException, Request
 
@@ -35,6 +36,76 @@ def verify_pwd(pwd: str, stored: str) -> bool:
         return hmac.compare_digest(digest.hex(), expect)
     except Exception:
         return False
+
+
+# ── 管理端密码策略 ─────────────────────────────────────
+#
+# 生产事故复盘：公网面板的 admin 密码被设成了 `admin123`，攻击者直接登录，
+# 导出了全部账号凭据。登录失败锁定拦不住「已知弱口令」——必须在设置密码时
+# 就拒绝，而不是等到被撞开以后。这里只做最小、确定的规则：
+#   · 至少 12 位；
+#   · 常见弱口令（含 admin/password/123456 等变体）直接拒绝；
+#   · 不允许「用户名 + 纯数字」；
+#   · 不允许纯数字或单一重复字符。
+# 不做复杂度打分/字典工程：规则越复杂越容易误伤，真正兜底的是长度与黑名单。
+MIN_PASSWORD_LENGTH = 12
+
+_WEAK_PASSWORDS = frozenset({
+    'admin', 'admin123', 'admin1234', 'admin12345', 'admin123456',
+    'admin1234567', 'admin12345678', 'admin123456789',
+    'password', 'password123', 'password1234', 'password12345',
+    '123456789012', '1234567890123', '12345678901234',
+    'qwertyuiop', 'qwerty123456', 'qwertyuiop123',
+    'workbuddy', 'workbuddy123', 'workbuddy1234', 'workbuddy2024',
+    'letmein12345', 'iloveyou1234', '111111111111', '000000000000',
+})
+
+
+def password_problem(pwd: str, username: str = '') -> str | None:
+    """返回密码不合规的原因；合规返回 None。
+
+    给 bootstrap（WB_ADMIN_PASSWORD）、新建用户、重置密码共用同一套判据，
+    避免「启动时能设弱口令、界面改密码时却被拦」这种不一致。
+    """
+    value = str(pwd or '')
+    if len(value) < MIN_PASSWORD_LENGTH:
+        return f'密码至少 {MIN_PASSWORD_LENGTH} 位'
+    low = value.lower()
+    if low in _WEAK_PASSWORDS:
+        return '密码过于常见，请换一个'
+    if username:
+        user = str(username).strip().lower()
+        if user and low.startswith(user) and low[len(user):].isdigit():
+            return '密码不能是用户名加数字'
+    if value.isdigit():
+        return '密码不能全是数字'
+    if len(set(value)) == 1:
+        return '密码不能是重复字符'
+    return None
+
+
+def weak_admin_passwords() -> list[str]:
+    """启动时检测**存量**管理员是否仍在用已知弱口令。
+
+    新密码在设置入口就被拦了，但升级上来的 users.json 里可能已经有
+    `admin123` 这类值（本次生产事故就是如此）。这里只拿小的静态黑名单去比对
+    哈希，命中就返回用户名，让启动日志能明确点出来；不直接拒绝启动——
+    否则用户会被锁在面板外，连改密码的入口都没有。
+    """
+    try:
+        cfg = load_users()
+    except Exception:  # noqa: BLE001
+        return []
+    found: list[str] = []
+    for item in cfg.get('users', []):
+        if item.get('role') != 'admin':
+            continue
+        stored = str(item.get('pwd_hash') or '')
+        for candidate in _WEAK_PASSWORDS:
+            if verify_pwd(candidate, stored):
+                found.append(str(item.get('username') or ''))
+                break
+    return found
 
 
 # ── 用户存储 ─────────────────────────────────────────────
@@ -128,18 +199,28 @@ def save_users(data: dict) -> None:
 
 
 def bootstrap_users() -> dict:
-    """首次启动：创建 admin 用户，密码取 WB_ADMIN_PASSWORD 或随机生成并打印一次。"""
+    """首次启动：创建 admin 用户，密码取 WB_ADMIN_PASSWORD 或随机生成。"""
     import os
     import sys
 
-    pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip() or secrets.token_urlsafe(9)
+    env_pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip()
+    if env_pwd:
+        problem = password_problem(env_pwd, 'admin')
+        if problem:
+            raise RuntimeError(
+                f'WB_ADMIN_PASSWORD 不符合管理端密码策略：{problem}。'
+                f'请使用至少 {MIN_PASSWORD_LENGTH} 位、非常见弱口令的密码。'
+            )
+    # 随机密码也留足长度；token_urlsafe(12) 约 16 字符。
+    pwd = env_pwd or secrets.token_urlsafe(12)
     data = {
         'secret': config.new_secret(),
         'users': [{'username': 'admin', 'role': 'admin', 'pwd_hash': make_hash(pwd)}],
         'api_keys': [],
     }
     save_users(data)
-    if not os.environ.get('WB_ADMIN_PASSWORD', '').strip():
+    if not env_pwd:
+        _write_initial_password_file(pwd)
         print('=' * 60, file=sys.stderr)
         print('[WorkBuddy Manager] 已生成初始管理员账号', file=sys.stderr)
         print(f'  用户名: admin', file=sys.stderr)
@@ -147,6 +228,55 @@ def bootstrap_users() -> dict:
         print('  请登录后立即在「设置 → 管理用户」中修改密码。', file=sys.stderr)
         print('=' * 60, file=sys.stderr)
     return data
+
+
+def initial_password_path() -> Path:
+    """初始密码落盘文件的位置（与 users.json 同级）。"""
+    return config.USERS_FILE.with_name('initial-admin-password.txt')
+
+
+def _write_initial_password_file(pwd: str) -> None:
+    """把随机生成的初始密码落盘，0600。
+
+    为什么必须留一份：随机密码**只在 stderr 打一次**（issue #179）。journal 会被
+    轮转、安装脚本可能因为竞态没抓到、用户在几屏日志里也可能翻过去 —— 一旦错过，
+    库里只有 pbkdf2 哈希，`users.json` 里也读不出明文，于是**没有任何办法登录**。
+    落一份明文 + 登录页指路，是唯一能把这个死结解开的办法。
+
+    权限与 users.json 同级（仅属主可读写）：那已经是能伪造任意管理员会话的
+    secret 所在，再多一个同样只属主可读的明文密码不改变暴露面。
+
+    改过密码后由 clear_initial_password_file() 抹掉。
+    """
+    target = initial_password_path()
+    try:
+        # 与 save_users 同样的降级写法：不支持 O_CREAT mode 的平台上退化为
+        # 写完再 chmod，并继续收紧权限。
+        try:
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(f'{pwd}\n')
+        else:
+            target.write_text(f'{pwd}\n', encoding='utf-8')
+        _restrict_permissions(target)
+    except OSError:
+        # 写不进去也不能影响启动：日志里那条记录仍然是唯一副本。
+        pass
+
+
+def clear_initial_password_file() -> None:
+    """密码被改掉（或显式重置）后，抹掉明文副本。
+
+    留着旧密码文件等于给了一份永远有效的凭据 —— 那正是 issue #179 想要的
+    「找回来」能力用过期的方式继续生效，安全上不能接受。
+    """
+    try:
+        initial_password_path().unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── 会话签名 ─────────────────────────────────────────────
@@ -386,13 +516,16 @@ def revoke_sessions(username: str) -> int:
     return new_sv
 
 
-def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -> None:
+def audit(actor: dict | None, action: str, target: str = '', detail: str = '',
+          ip: str = '') -> None:
     """记录一条管理端审计日志。
 
     为什么必须做：本次事故中，攻击者改掉管理员密码、建了自己的账号，而**服务端
     没有留下任何痕迹**——只能靠反代 access log 去猜。管理端是公网入口，
     敏感操作（登录、改密码、增删用户、改安全配置）必须可追溯。
 
+    `ip` 是可选的结构化来源地址。历史调用把来源写进 detail（`来源 x.x.x.x`），
+    这里保留兼容；新调用应同时传 `ip`，方便按列筛选/告警，不必再解析文本。
     审计属于旁路，任何异常都不能影响请求本身（与请求日志同样的处理原则）。
     """
     try:
@@ -402,6 +535,7 @@ def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -
             str(action),
             str(target or ''),
             str(detail or '')[:500],
+            str(ip or '')[:64],
         )
     except Exception:  # noqa: BLE001
         pass
