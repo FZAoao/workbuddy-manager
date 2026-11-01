@@ -602,6 +602,12 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
         # 只留最后一个会把前文丢掉（自审发现的边界）。
         pending_reasoning: str | None = None
 
+        # 已发出、尚未被结果消费的 tool_call id。
+        # 客户端可能只下发 function_call_output 而没有对应的 function_call
+        # （Codex 的 agent 创建会话就是这种形状），原样写成 role=tool 会让
+        # 上游以 11148 tool_call_mismatch 拒绝整段历史。
+        open_call_ids: list[str] = []
+
         def take_reasoning() -> str | None:
             """取走累积的推理文本并把状态清空。"""
             nonlocal pending_reasoning
@@ -645,6 +651,9 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                 if not reuse_previous:
                     messages.append(msg)
                 tool_group_open = True
+                open_call_ids.extend(
+                    str(call.get('id') or '') for call in pending_calls if call.get('id')
+                )
                 pending_calls.clear()
 
         def flush_tool_group() -> None:
@@ -745,11 +754,36 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                 # flush_tool_group；顺序即语义，图片属于这批工具调用）。
                 output = item.get('output')
                 out_text, out_images = _split_tool_output(output)
-                messages.append({
-                    'role': 'tool',
-                    'tool_call_id': str(item.get('call_id') or ''),
-                    'content': out_text,
-                })
+                raw_call_id = str(item.get('call_id') or '')
+                if raw_call_id:
+                    # 保持既有契约：带 call_id 的结果一律按 tool 消息处理
+                    if raw_call_id in open_call_ids:
+                        open_call_ids.remove(raw_call_id)
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': raw_call_id,
+                        'content': out_text,
+                    })
+                elif open_call_ids:
+                    # 客户端未下发 call_id：若恰好有未消费调用，按声明顺序配对
+                    matched_id = open_call_ids.pop(0)
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': matched_id,
+                        'content': out_text,
+                    })
+                else:
+                    # 无 call_id 且没有未消费调用 = 孤儿工具结果。
+                    # Codex 的 agent 创建会话就是这种形状：只有
+                    # function_call_output，没有对应的 function_call。
+                    # 直接写 role=tool 会被上游以 11148 tool_call_mismatch
+                    # 拒绝整段历史，这里降级为 user 消息以保留内容
+                    # （委派任务就在 output 里）。
+                    tool_name = str(item.get('name') or 'tool')
+                    messages.append({
+                        'role': 'user',
+                        'content': f'[tool output: {tool_name}]\n{out_text}',
+                    })
                 # 图片**不立即落**：插在两条 tool 结果之间会破坏上游的
                 # 成组配对校验（11148），等组结束由 flush_tool_group 补。
                 pending_tool_images.extend(out_images)
@@ -1465,6 +1499,10 @@ class _StreamTranslator:
             out.append(_event('response.reasoning_summary_text.delta', {
                 'type': 'response.reasoning_summary_text.delta',
                 'output_index': self.reason_index,
+                # summary_index 是规范里的必填字段（summary 为数组，这里恒为第 0 段）。
+                # 缺了它，ai-sdk 的 zod 校验匹配不上任何具名分支，整帧落进
+                # unknown_chunk 兜底并被静默丢弃 —— 客户端只看到空的思考块（issue #348）。
+                'summary_index': 0,
                 'item_id': self.reason_id,
                 'delta': reasoning,
             }))
@@ -1669,6 +1707,12 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         return _failed('input 为空：Responses 请求必须带 input 或 instructions',
                        400, 'invalid_request_error', 'empty_input')
 
+    # 思考档位（issue #319）：与 chat 路径同口径，把**实际发往上游**的
+    # reasoning_effort 记进请求日志。取转换后的 payload 而不是原始 body ——
+    # Responses 的档位藏在 reasoning.effort 里，转换后才变成 reasoning_effort。
+    effort = payload.get('reasoning_effort')
+    effort = effort.strip()[:16] if isinstance(effort, str) and effort.strip() else None
+
     if mapped:
         payload['model'] = mapped
     if stream:
@@ -1704,7 +1748,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                usage=usage,
+                usage=usage, effort=effort,
             )
             if resp.status_code >= 400:
                 return _failed(_upstream_error_text(data, resp), resp.status_code,
@@ -1859,7 +1903,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                usage=usage, first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms, effort=effort,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from urllib.parse import urlsplit
 import logging
 import threading
@@ -23,8 +24,71 @@ logger = logging.getLogger('workbuddy.gateway')
 router = APIRouter(tags=['gateway'])
 
 
+# 上游 6004 的重置文案：「将在 2026-10-29 16:21:07 UTC+8 重置」。时区后缀必须
+# 一起匹配：面板进程可能跑在 UTC 或别的时区，只按本地时间算会差出整小时级
+# （最坏被 86400 上限截成 1 天，等于让客户端白等一天）。
+_RETRY_AT_RE = re.compile(
+    r'将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})'
+    r'(?:\s*UTC\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?)?')
+
+
+def _retry_after_seconds(text: str | None) -> int | None:
+    """把上游 429 文案里的「将在 YYYY-MM-DD HH:MM:SS [UTC±N] 重置」换成秒数。
+
+    上游 6004 的正文自带重置墙钟，客户端却只能从中文里自己抠——退回给它们一个
+    标准头，重试节奏由协议决定，不靠猜。**时区以文案里的 `UTC±N` 为准**（缺省
+    才按面板本地时间），否则面板跑在 UTC 时算出的间隔会整体差 8 小时。
+    """
+    if not text:
+        return None
+    match = _RETRY_AT_RE.search(text)
+    if not match:
+        return None
+    try:
+        import datetime as _dt
+        y, mo, d, h, mi, sec = (int(g) for g in match.groups()[:6])
+        sign, hours, minutes = match.group(7), match.group(8), match.group(9)
+        tz = None
+        if sign:
+            offset = _dt.timedelta(hours=int(hours), minutes=int(minutes or 0))
+            tz = _dt.timezone(-offset if sign == '-' else offset)
+        when = _dt.datetime(y, mo, d, h, mi, sec, tzinfo=tz)
+        now = _dt.datetime.now(tz) if tz is not None else _dt.datetime.now()
+    except (TypeError, ValueError):
+        return None
+    delta = (when - now).total_seconds()
+    if delta <= 1:
+        return None
+    return int(min(delta, 86400))
+
+
+def _retry_after_header(seconds: int | None) -> dict[str, str] | None:
+    if not seconds or seconds <= 0:
+        return None
+    return {'Retry-After': str(int(seconds))}
+
+
+def _model_missing_body(payload: object, text: str) -> dict | None:
+    """上游把「该模型在所有账号上都不存在」（11102）包成 503 时改判 404。
+
+    重试无意义（换多少账号都没有这个模型），而 5xx 会让客户端反复重试、也把
+    排障方向带到「号池挂了」。只在文案确实来自 11102 时改判，其余原样透传。
+    """
+    if not text or ('11102' not in text and 'service info not found' not in text):
+        return None
+    err = payload.get('error') if isinstance(payload, dict) else None
+    message = str(err.get('message') or '') if isinstance(err, dict) else ''
+    body: dict = {'error': {'message': message or text[:500],
+                            'type': 'invalid_request_error',
+                            'code': 'model_not_found'}}
+    if isinstance(err, dict) and err.get('gateway_hint'):
+        body['error']['gateway_hint'] = err['gateway_hint']
+    return body
+
+
 def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request_error',
-               code: str | None = None, hint: str | None = None) -> JSONResponse:
+               code: str | None = None, hint: str | None = None,
+               retry_after: int | None = None) -> JSONResponse:
     """OpenAI 形状的错误体。
 
     `hint` 对应上游 2026-09-16 新增的 `error.gateway_hint`：与 message **并列**的
@@ -38,7 +102,8 @@ def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request
     err: dict = {'message': message, 'type': err_type, 'code': code}
     if hint:
         err['gateway_hint'] = hint
-    return JSONResponse({'error': err}, status_code=status)
+    return JSONResponse({'error': err}, status_code=status,
+                        headers=_retry_after_header(retry_after))
 
 
 def _bearer(request: Request) -> str:
@@ -422,7 +487,116 @@ def _usage_cache(usage: dict | None) -> tuple[int | None, int | None, int | None
             _one('prompt_cache_write_tokens'))
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None) -> None:
+# 客户端渠道归类（issue #233）：只用于日志可观测性，**不改变转发行为**。
+#
+# 为什么要它：429 / 6004 是账号级或模型级冷却，出问题时最想知道「是哪类客户端
+# 把号打冷的」。UA 是唯一无需客户端配合就能拿到的来源维度；归类宁可粗、不可猜错：
+# 认不出就记 other，不把「可能是」写成「就是」。
+def client_channel(ua: str | None) -> str:
+    text = (ua or '').strip().lower()
+    if not text:
+        return 'unknown'
+    if 'codex' in text:
+        return 'codex'
+    if 'claude-code' in text or 'claude code' in text:
+        return 'claude-code'
+    if 'deepseek' in text or 'dsh' in text:
+        return 'dsh'
+    if 'vscode' in text or 'visual studio code' in text or 'cursor' in text:
+        return 'vscode'
+    if 'jetbrains' in text or 'intellij' in text:
+        return 'jetbrains'
+    if 'workbuddy' in text:
+        return 'wb'
+    if 'mozilla' in text or 'chrome/' in text or 'safari/' in text or 'edg/' in text:
+        return 'web'
+    if any(k in text for k in ('python', 'httpx', 'requests/', 'curl/', 'node-fetch',
+                               'axios', 'okhttp', 'go-http-client')):
+        return 'api'
+    return 'other'
+
+
+def _image_part_to_openai(part: dict) -> dict | None:
+    """把常见的「非标准图片 part」归一成 OpenAI 的 image_url 形态（issue #134）。
+
+    各家客户端写法不一，上游只认 `{"type":"image_url","image_url":{"url":...}}`：
+      · `{"type":"input_image","image_url":"data:..."}`（Responses 风格混进 chat）
+      · `{"type":"image_url","image_url":"https://..."}`（url 直接给字符串）
+      · Anthropic 风格 `{"type":"image","source":{"type":"base64",...}}`
+    认不出的原样返回 None（调用方保持原 part 不动），不做有损改写。
+    """
+    kind = part.get('type')
+
+    def _url_of(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            inner = value.get('url')
+            return inner if isinstance(inner, str) else ''
+        return ''
+
+    if kind in ('input_image', 'image_url'):
+        url = _url_of(part.get('image_url')) or _url_of(part.get('url'))
+        if url:
+            image_url: dict = {'url': url}
+            # `detail` 必须跟着搬：丢了它上游按 auto 处理，图片清晰度与被压缩的
+            # 程度都跟客户端要的不一样（`detail: high` 会被悄悄降级）。两种来源
+            # 都要看 —— `input_image` 是 Responses 风格（写在 part 顶层），
+            # `image_url` 是 chat 风格（写在 image_url 对象里）。
+            detail = part.get('detail')
+            if isinstance(part.get('image_url'), dict):
+                detail = part['image_url'].get('detail', detail)
+            if isinstance(detail, str) and detail in ('auto', 'low', 'high'):
+                image_url['detail'] = detail
+            return {'type': 'image_url', 'image_url': image_url}
+        return None
+    if kind == 'image':
+        source = part.get('source')
+        if isinstance(source, dict):
+            stype = str(source.get('type') or '')
+            if stype == 'base64':
+                media = str(source.get('media_type') or 'image/png')
+                data = source.get('data')
+                if isinstance(data, str) and data:
+                    return {'type': 'image_url',
+                            'image_url': {'url': f'data:{media};base64,{data}'}}
+            elif stype == 'url':
+                url = _url_of(source.get('url'))
+                if url:
+                    return {'type': 'image_url', 'image_url': {'url': url}}
+    return None
+
+
+def normalize_chat_images(body: object) -> int:
+    """就地归一 chat 请求里的图片 part，返回改写的数量。
+
+    只动 `messages[*].content` 里的**列表**；字符串内容与其他字段一字不改。
+    客户端发图失败时最常见的形态是 url 直接给字符串或 input_image 混用，
+    上游解析不了就整条 400，这里换成标准形态即可（issue #134）。
+    """
+    if not isinstance(body, dict):
+        return 0
+    messages = body.get('messages')
+    if not isinstance(messages, list):
+        return 0
+    changed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content')
+        if not isinstance(content, list):
+            continue
+        for idx, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            fixed = _image_part_to_openai(part)
+            if fixed is not None and fixed != part:
+                content[idx] = fixed
+                changed += 1
+    return changed
+
+
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -481,6 +655,10 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             cache_hit_tokens=cache_hit,
             cache_miss_tokens=cache_miss,
             cache_write_tokens=cache_write,
+            # 思考强度只作展示：客户端传什么记什么，不做推断（NULL=没传/旧记录）。
+            effort=db._clean(effort, 16) if effort else None,
+            # 客户端渠道（issue #233）：UA 归类，供日志页按来源排查限流来源。
+            channel=client_channel(ua),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning('写入请求日志失败（不影响请求）: %s', exc)
@@ -496,6 +674,23 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
                 db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm)
         except Exception as exc:  # noqa: BLE001
             logger.warning('累计用量失败（不影响请求）: %s', exc)
+
+
+def _global_ip_blocked(ip: str) -> bool:
+    """全局入站 IP 规则是否拦截该来源（未启用安全策略时恒为放行）。
+
+    从 `_authorize` 抽出：`/v1/usage` 与调用路径必须同口径——它虽是只读端点，
+    但同样暴露密钥元数据与余量，被全局黑名单拦住的来源不该换条路就能查
+    （2026-10-21 安全检查 L4）。
+    """
+    sec = get_security_config()
+    if not sec.get('enabled'):
+        return False
+    rules = [
+        {'kind': r['kind'], 'cidr': r['cidr']}
+        for r in db.query('SELECT kind, cidr FROM ip_rules')
+    ]
+    return not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist'))
 
 
 def _authorize(request: Request, model: str | None,
@@ -532,16 +727,10 @@ def _authorize(request: Request, model: str | None,
     mapped = _map_model(model) if mapped is None else mapped
 
     # 全局入站 IP 规则
-    sec = get_security_config()
-    if sec.get('enabled'):
-        rules = [
-            {'kind': r['kind'], 'cidr': r['cidr']}
-            for r in db.query('SELECT kind, cidr FROM ip_rules')
-        ]
-        if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
-            _log_ip(ip, path, True, ua, 'ip_blocked')
-            _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
-            return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
+    if _global_ip_blocked(ip):
+        _log_ip(ip, path, True, ua, 'ip_blocked')
+        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
     # 模型与版本不符 / IP 白名单）发生在这之后，若就这样返回，日志里会显示
@@ -556,11 +745,13 @@ def _authorize(request: Request, model: str | None,
         _record(key, ip, model or '', mapped or '',
                 getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
         _log_ip(ip, path, True, ua, _key_reject_code(reason, is_model_list))
+        reject_status = getattr(reason, 'status', 403)
         return None, ip, _oai_error(
             reason,
-            getattr(reason, 'status', 403),
+            reject_status,
             getattr(reason, 'err_type', 'permission_error'),
             getattr(reason, 'code', 'forbidden'),
+            retry_after=60 if reject_status == 429 else None,
         )
 
     limited, count = _rate_limited(key)
@@ -568,7 +759,8 @@ def _authorize(request: Request, model: str | None,
         msg = f'请求过于频繁（{RATE_WINDOW}s 内超过 {RATE_MAX_PER_MIN} 次）'
         _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
         _log_ip(ip, path, True, ua, 'rate_limited')
-        return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded')
+        return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded',
+                                    retry_after=RATE_WINDOW)
 
     _log_ip(ip, path, False, ua)
     return key, ip, None
@@ -730,6 +922,12 @@ def key_usage(request: Request):
     if not key:
         _log_ip(ip, path, True, ua, 'invalid_key')
         return _oai_error('API Key 无效', 401, 'authentication_error', 'invalid_api_key')
+
+    # 全局入站 IP 规则：与其他 /v1 入口同口径（见 _global_ip_blocked 的说明）。
+    if _global_ip_blocked(ip):
+        _log_ip(ip, path, True, ua, 'ip_blocked')
+        _record(key, ip, '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        return _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     def allowance(limit: int | None, used: int | None) -> dict:
         used_n = int(used or 0)
@@ -1060,6 +1258,18 @@ async def _chat(request: Request, upstream_path: str):
     # 鉴权后、转发前压回上限。
     clamp_max_tokens(body)
 
+    # 图片 part 归一（issue #134）：把 input_image / image_url 字符串 /
+    # Anthropic source 形态改写成上游认的标准形态；认不出的原样保留。
+    normalize_chat_images(body)
+
+    # 思考强度（reasoning_effort）：仅用于日志展示，**不改写请求体**——
+    # 档位归一化/降级由上游网关负责，面板只记录客户端实际传了什么。
+    effort = None
+    if isinstance(body, dict):
+        raw_effort = body.get('reasoning_effort')
+        if isinstance(raw_effort, str) and raw_effort.strip():
+            effort = raw_effort.strip()[:16]
+
     stream = bool(isinstance(body, dict) and body.get('stream'))
     if stream:
         # 让上游在最后一个 chunk 返回 usage，便于精确计量
@@ -1089,13 +1299,27 @@ async def _chat(request: Request, upstream_path: str):
             pt = int(usage.get('prompt_tokens') or 0)
             ct = int(usage.get('completion_tokens') or 0)
             error = None if resp.status_code < 400 else (str(data)[:500] if data is not None else resp.text[:500])
+            # 只在出错时读一次正文：成功路径不该为了「万一要改判」去碰 .text
+            #（那会让只有 json() 的响应对象直接炸，也白读一遍大响应体）。
+            text_repr = resp.text[:2000] if resp.status_code >= 400 else ''
+            missing = _model_missing_body(data, text_repr) if resp.status_code >= 500 else None
+            # 记账用「实际回给客户端的」状态码：11102 改判成 404 之后，日志里再写
+            # 503 会让人以为号池挂了（与响应体不一致）。
+            rec_status = 404 if missing is not None else resp.status_code
             _record(
-                key, ip, requested_model or '', mapped or '', resp.status_code, pt, ct,
-                latency, ua, error, False, usage=usage,
+                key, ip, requested_model or '', mapped or '', rec_status, pt, ct,
+                latency, ua, error, False, usage=usage, effort=effort,
             )
+            if missing is not None:
+                return JSONResponse(missing, status_code=404)
+            retry_after = None
+            if resp.status_code == 429 and data is not None:
+                retry_after = _retry_after_seconds(json.dumps(data, ensure_ascii=False))
+            headers = _retry_after_header(retry_after)
             if data is not None:
-                return JSONResponse(data, status_code=resp.status_code)
-            return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}}, status_code=resp.status_code)
+                return JSONResponse(data, status_code=resp.status_code, headers=headers)
+            return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}},
+                                status_code=resp.status_code, headers=headers)
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
@@ -1109,11 +1333,37 @@ async def _chat(request: Request, upstream_path: str):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort)
         return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code
     content_type = resp.headers.get('content-type', 'text/event-stream')
+
+    # 上游的 4xx/5xx 不是 SSE（正文是一小段 JSON），原先按流原样透传：客户端
+    # 拿不到 Retry-After，11102 也只能以 503 出现。这里读完整段错误体后按 JSON
+    # 返回，状态码与文案保持上游原样（唯一的例外是 11102 → 404）。
+    if status_code >= 400:
+        raw = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        text = raw.decode('utf-8', errors='replace')
+        try:
+            payload: object = json.loads(text)
+        except Exception:  # noqa: BLE001
+            payload = None
+        latency = int((time.time() - started) * 1000)
+        missing = _model_missing_body(payload, text) if status_code >= 500 else None
+        rec_status = 404 if missing is not None else status_code
+        _record(key, ip, requested_model or '', mapped or '', rec_status, 0, 0,
+                latency, ua, text[:500], True, effort=effort)
+        if missing is not None:
+            return JSONResponse(missing, status_code=404)
+        headers = _retry_after_header(
+            _retry_after_seconds(text) if status_code == 429 else None)
+        if payload is not None:
+            return JSONResponse(payload, status_code=status_code, headers=headers)
+        return JSONResponse({'error': {'message': text[:1000], 'type': 'api_error'}},
+                            status_code=status_code, headers=headers)
 
     async def generator():
         usage: dict = {}
@@ -1148,7 +1398,7 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
-                first_token=first_token_ms,
+                first_token=first_token_ms, effort=effort,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)

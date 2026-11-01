@@ -46,6 +46,7 @@ const STUB = {
   'settings.tabUpstream': '上游配置', 'settings.tabProxy': '代理',
   'settings.tabModels': '模型映射',
   'settings.tabUsers': '用户', 'settings.tabTokens': '令牌', 'settings.tabSystem': '系统',
+  'settings.tabWatchdog': '页面监控',
   'settings.tabBackup': '数据备份',
   'settings.tabChangelog': '更新日志', 'settings.tabAbout': '关于',
 };
@@ -78,7 +79,7 @@ check(
 );
 
 check(
-  '设置页 8 个 Tab 都在面板里，且标签键与清单模块一致',
+  '设置页 10 个 Tab 都在面板里，且标签键与清单模块一致',
   SETTINGS_TABS.map((tab) => {
     const found = byHref.get(settingsTabHref(tab));
     return found ? found.labelKey === SETTINGS_TAB_LABEL_KEYS[tab] : `缺 ${settingsTabHref(tab)}`;

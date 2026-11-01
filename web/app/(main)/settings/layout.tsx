@@ -22,6 +22,7 @@ import {
   KeyRound,
   PackagePlus,
   Route,
+  Radar,
 } from 'lucide-react';
 import {usePathname} from 'next/navigation';
 import {notify} from '@/lib/toast';
@@ -56,6 +57,7 @@ import {RestockLinksPanel} from '@/components/common/settings/RestockLinksPanel'
 import {ProxyPanel} from '@/components/common/settings/ProxyPanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
+import {WatchdogPanel} from '@/components/common/settings/WatchdogPanel';
 import {UpstreamReloadNotice} from '@/components/common/settings/UpstreamReloadNotice';
 import {CopyButton} from '@/components/ui/copy-button';
 import {Button} from '@/components/ui/button';
@@ -609,6 +611,14 @@ const UPSTREAM_FIELDS: Field[] = [
     desc: '是否把客户端 IP（X-Forwarded-For / X-Real-IP）透传给上游。缺省关闭——不把内网/代理 IP 暴露给上游',
     def: false,
   },
+  {
+    key: 'gzip_body',
+    kind: 'bool',
+    label: '压缩大请求体（gzip）',
+    desc: '超过 64 KB 的对话请求先 gzip 压缩再发给上游。服务器出口带宽窄时长上下文的'
+      + '首字节能快 20 秒以上；短对话不压缩、无额外开销。上游不接受压缩时会自动改用未压缩重发',
+    def: true,
+  },
 ];
 
 /**
@@ -932,6 +942,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
     tokens: {icon: <KeyRound className="h-3.5 w-3.5" />},
     restock: {icon: <PackagePlus className="h-3.5 w-3.5" />},
     system: {icon: <DownloadCloud className="h-3.5 w-3.5" />},
+    watchdog: {icon: <Radar className="h-3.5 w-3.5" />},
     backup: {icon: <Database className="h-3.5 w-3.5" />},
     changelog: {icon: <FileText className="h-3.5 w-3.5" />},
     about: {icon: <Info className="h-3.5 w-3.5" />},
@@ -2186,6 +2197,11 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
 
         <TabsContent value="system" className="mt-4 space-y-4">
           <UpdatePanel />
+        </TabsContent>
+
+        {/* ═══ 页面监控 ═══ */}
+        <TabsContent value="watchdog" className="mt-4 space-y-4">
+          <WatchdogPanel />
         </TabsContent>
 
         {/* ═══ 数据备份 ═══ */}

@@ -117,6 +117,8 @@ _state: dict = {
     'running': False,
     'mode': '',
     'target': '',
+    'group': '',
+    'auth_dir': '',
     'started_at': 0,
     'finished_at': 0,
     'exit_code': None,
@@ -326,7 +328,17 @@ def _python() -> str:
     return sys.executable or 'python3'
 
 
-def available(school: bool = False) -> tuple[bool, str]:
+def _auth_dir(value: Path | str | None) -> Path:
+    """这次执行读哪个账号目录（issue #274：多分组）。
+
+    不传 = 默认分组（`config.AUTH_DIR`），与引入多分组前逐字一致；
+    其他分组由路由解析后传进来。
+    """
+    return Path(value) if value else config.AUTH_DIR
+
+
+def available(auth_dir: Path | str | None = None,
+              school: bool = False) -> tuple[bool, str]:
     """能否执行（上游目录与脚本是否到位）。返回 (可用, 说明)。
 
     单独抽出来是为了让接口能在**动手前**就拒绝，并把原因说清楚 ——
@@ -348,15 +360,16 @@ def available(school: bool = False) -> tuple[bool, str]:
             '  · 源码部署：请确认上游目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
             '可到「设置 → 系统更新」更新上游。'
         )
-    if not config.AUTH_DIR.is_dir():
+    auths = _auth_dir(auth_dir)
+    if not auths.is_dir():
         return False, (
-            f'账号目录不存在（{config.AUTH_DIR}），无法确定对哪些账号执行。'
-            '请检查 WB_AUTH_DIR 配置。'
+            f'账号目录不存在（{auths}），无法确定对哪些账号执行。'
+            '请检查该分组的账号目录配置（或默认分组的 WB_AUTH_DIR）。'
         )
     return True, ''
 
 
-async def available_async() -> tuple[bool, str]:
+async def available_async(auth_dir: Path | str | None = None) -> tuple[bool, str]:
     """`available()` 的**线程池**版本，供事件循环内的调用方使用。
 
     为什么需要：`available()` 可能 fork `docker inspect`（≤15s）与 `docker cp`
@@ -366,7 +379,7 @@ async def available_async() -> tuple[bool, str]:
 
     与 `tasklog` 读容器日志同一个做法（那里也是 `asyncio.to_thread`）。
     """
-    return await asyncio.to_thread(available)
+    return await asyncio.to_thread(available, auth_dir)
 
 
 def status() -> dict:
@@ -384,10 +397,14 @@ def status() -> dict:
     # 本次运行从脚本 stdout 抓到的中奖记录（开学季抽奖）：上游只把中奖打在脚本
     # 输出里，不单独给出来，界面上就永远看不到「中了什么」。
     snap['prizes'] = list(_state['prizes'])
-    snap['available'], snap['unavailable_reason'] = available()
+    # 可用性按**这次/上次运行的账号目录**判断（多分组，issue #274）：
+    # 非默认分组的目录不存在时，不能因为默认分组可用就显示「可执行」。
+    run_dir = snap.get('auth_dir') or None
+    snap['available'], snap['unavailable_reason'] = available(run_dir)
     # 开学季走的是另一个脚本，可用性单独探测（它可能因上游版本较旧而不存在，
-    # 与成长任务脚本的可用性互不影响）。
-    snap['school_available'], snap['school_unavailable_reason'] = available(school=True)
+    # 与成长任务脚本的可用性互不影响），同样按本次运行的账号目录判断。
+    (snap['school_available'],
+     snap['school_unavailable_reason']) = available(run_dir, school=True)
     snaps = db.get_setting('task_claim_schedule') or {}
     snap['schedule'] = snaps if isinstance(snaps, dict) else {}
     return snap
@@ -410,10 +427,12 @@ def build_command(mode: str, target: str) -> list[str]:
     return [_python(), '-u', str(runner), str(script), target, *_MODE_ARGS[mode]]
 
 
-def _prepare(mode: str, target: str) -> tuple[bool, object]:
+def _prepare(mode: str, target: str, auth_dir: Path | str | None = None,
+             group_name: str = '') -> tuple[bool, object]:
     """启动前的**阻塞**准备：校验可用性 + 构造 argv。
 
-    返回 (ok, payload)：ok 为 False 时 payload 是给用户的原因说明，否则是 argv。
+    返回 (ok, payload)：ok 为 False 时 payload 是给用户的原因说明，否则是
+    执行参数 dict（argv / auth_dir / group）。
 
     单独拆出来是这次修 bug 的关键（issue #31）：启动这件事有两半，性质完全不同——
       · **这一半是阻塞的**：`available()` 可能 fork `docker inspect` / `docker cp`
@@ -424,7 +443,8 @@ def _prepare(mode: str, target: str) -> tuple[bool, object]:
     → 线程池的工作线程没有运行中的事件循环，`get_running_loop()` 必然抛
     RuntimeError，于是「一键执行」100% 报「当前环境没有事件循环，无法后台执行」。
     """
-    ok, why = available(mode in _SCHOOL_MODES)
+    # 两个维度都要带上：分组（auth_dir）决定账号目录，模式决定用哪个脚本。
+    ok, why = available(auth_dir, school=mode in _SCHOOL_MODES)
     if not ok:
         return False, why
     if _state['running']:
@@ -433,10 +453,14 @@ def _prepare(mode: str, target: str) -> tuple[bool, object]:
         argv = build_command(mode, target)
     except ValueError as exc:
         return False, str(exc)
-    return True, argv
+    return True, {
+        'argv': argv,
+        'auth_dir': str(_auth_dir(auth_dir)),
+        'group': group_name or '',
+    }
 
 
-def _launch(argv: list[str], mode: str, target: str, loop) -> tuple[bool, str]:
+def _launch(payload: dict, mode: str, target: str, loop) -> tuple[bool, str]:
     """登记状态并调度后台任务。**必须在事件循环线程里调用**（要 create_task）。
 
     「检查是否在跑 + 置 running」必须是**原子**的：`_prepare` 在线程池里做的
@@ -449,51 +473,65 @@ def _launch(argv: list[str], mode: str, target: str, loop) -> tuple[bool, str]:
     if _state['running'] or (_task is not None and not _task.done()):
         return False, (f'已有任务正在执行（{_state["mode"]} / {_state["target"]}），'
                        f'请等它结束')
+    group = str(payload.get('group') or '')
     _state.update({
         'running': True, 'mode': mode, 'target': target,
+        'group': group, 'auth_dir': str(payload.get('auth_dir') or ''),
         'started_at': int(time.time()), 'finished_at': 0,
         'exit_code': None, 'timed_out': False, 'error': '', 'lines': [],
         'prizes': [],
     })
-    _task = loop.create_task(_run(argv, mode, target))
-    return True, f'已开始执行（{mode}）'
+    _task = loop.create_task(_run(
+        list(payload['argv']), mode, target,
+        str(payload.get('auth_dir') or ''), group,
+    ))
+    where = f'{group} / ' if group else ''
+    return True, f'已开始执行（{where}{mode}）'
 
 
-async def start_async(mode: str, target: str = 'ALL') -> tuple[bool, str]:
+async def start_async(mode: str, target: str = 'ALL',
+                      auth_dir: Path | str | None = None,
+                      group_name: str = '') -> tuple[bool, str]:
     """启动一次执行（**不阻塞事件循环**的版本）。
 
     定时领奖循环与启动任务的 async 接口都走这里：把阻塞的准备丢进线程池，
     再回到事件循环线程里调度任务。两半的运行位置不能混（见 `_prepare`）。
+
+    `auth_dir` / `group_name` 用于多分组（issue #274）：不传 = 默认分组。
     """
-    ok, payload = await asyncio.to_thread(_prepare, mode, target)
+    ok, payload = await asyncio.to_thread(_prepare, mode, target, auth_dir, group_name)
     if not ok:
         return False, payload  # type: ignore[return-value]
-    return _launch(list(payload), mode, target, asyncio.get_running_loop())  # type: ignore[arg-type]
+    return _launch(payload, mode, target, asyncio.get_running_loop())  # type: ignore[arg-type]
 
 
-def start(mode: str, target: str = 'ALL') -> tuple[bool, str]:
+def start(mode: str, target: str = 'ALL',
+          auth_dir: Path | str | None = None,
+          group_name: str = '') -> tuple[bool, str]:
     """启动一次执行（同步版）。返回 (是否已启动, 说明)。
 
     要求**当前线程有运行中的事件循环**（要 create_task），且会阻塞它 ——
     所以事件循环里的调用方请用 `start_async()`。保留同步版是为了命令行/测试
     这类「本来就在 loop 线程里、且不在意短暂阻塞」的场景。
     """
-    ok, payload = _prepare(mode, target)
+    ok, payload = _prepare(mode, target, auth_dir, group_name)
     if not ok:
         return False, payload  # type: ignore[return-value]
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return False, '当前环境没有事件循环，无法后台执行'
-    return _launch(list(payload), mode, target, loop)  # type: ignore[arg-type]
+    return _launch(payload, mode, target, loop)  # type: ignore[arg-type]
 
 
-async def _run(argv: list[str], mode: str, target: str) -> None:
+async def _run(argv: list[str], mode: str, target: str,
+               auth_dir: str = '', group: str = '') -> None:
     """跑子进程并把输出累积到状态里（尾部保留）。"""
     env = dict(os_environ())
     # 显式指定账号目录：脚本自身的回落顺序（WB2A_AUTHS > 仓库内 auths/ >
     # /root/...）不一定指向本面板管的那批文件，传错会「跑了个寂寞」还看不出来。
-    env['WB2A_AUTHS'] = str(config.AUTH_DIR)
+    # 多分组时这里是该分组的目录（issue #274），不是默认分组。
+    env['WB2A_AUTHS'] = auth_dir or str(config.AUTH_DIR)
     env['WB2A_PROXY_CONFIG'] = str(config.UPSTREAM_CONFIG)
     # 与 argv 里的 `-u` 双保险：两者都是「不缓冲」的表达，任一被忽略时另一个兜住
     # （脚本将来若自己拉起子进程，环境变量也能继承下去）。
@@ -574,10 +612,13 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
                 proc.kill()
             except ProcessLookupError:
                 pass
-        _state['running'] = False
         _state['finished_at'] = int(time.time())
+        # 顺序要紧：先记中奖与历史，**最后**才置 running=False。多分组串行执行时，
+        # 下一组会在 wait_idle() 看到 False 的瞬间立刻 _launch 并重置 _state ——
+        # 顺序反了会把上一组的中奖记录与历史记成本组的参数。
         _record_lottery(mode, target)
-        _record_history(mode, target)
+        _record_history(mode, target, group)
+        _state['running'] = False
 
 
 class _Stalled(Exception):
@@ -670,7 +711,7 @@ def _record_lottery(mode: str, target: str) -> None:
         logger.warning('写入抽奖记录失败（不影响执行）: %s', exc)
 
 
-def _record_history(mode: str, target: str) -> None:
+def _record_history(mode: str, target: str, group: str = '') -> None:
     """把这次执行的结果写进「任务记录」，让它在历史里能查到。
 
     只在**真正可能产生写入**的模式下记录（claim / full / school /
@@ -687,6 +728,7 @@ def _record_history(mode: str, target: str) -> None:
     level = 'ok'
     if _state['error'] or _state['timed_out'] or (_state['exit_code'] not in (0, None)):
         level = 'fail'
+    scope = f'{group}·{target}' if group else target
     try:
         db.add_task_logs([{
             'ts': _state['finished_at'] or int(time.time()),
@@ -694,9 +736,9 @@ def _record_history(mode: str, target: str) -> None:
             'kind': 'taskrun',
             'level': level,
             'credits': 0,
-            'message': f'{label}（{target}）{summary}',
-            # dedup_key 必须唯一：同一次执行只记一条，用结束时间戳即可
-            'dedup_key': f'taskrun:{mode}:{target}:{_state["finished_at"]}',
+            'message': f'{label}（{scope}）{summary}',
+            # dedup_key 必须唯一：同一次执行只记一条，用结束时间戳 + 分组即可
+            'dedup_key': f'taskrun:{group}:{mode}:{target}:{_state["finished_at"]}',
         }])
     except Exception as exc:  # noqa: BLE001
         logger.warning('写入任务执行记录失败（不影响执行）: %s', exc)
@@ -751,6 +793,22 @@ async def stop() -> bool:
     # _run 的 finally 已把 running 置回 False；任务若在启动前就被取消，兜一次底。
     _state['running'] = False
     _state['finished_at'] = int(time.time())
+    return True
+
+
+async def wait_idle(poll_seconds: float = 1.0,
+                    timeout_seconds: float | None = None) -> bool:
+    """等待当前执行结束（多分组定时任务串行执行时用，issue #274）。
+
+    脚本一次只允许跑一个账号目录，所以定时计划必须「启动 → 等结束 → 下一组」。
+    返回 True = 已空闲；False = 超时仍没结束（调用方如实记为失败）。
+    默认不设超时：`_run` 自己有空闲/总时长上限，会在那里终止。
+    """
+    started = time.time()
+    while _state['running']:
+        if timeout_seconds is not None and time.time() - started > timeout_seconds:
+            return False
+        await asyncio.sleep(poll_seconds)
     return True
 
 

@@ -2,7 +2,7 @@
  * 设置页的二级 Tab 清单与路径解析（批次 4 的 P1-2）。
  *
  * **为什么要把它单独放在一个零依赖模块里**：Tab 名字、顺序、默认项、路径形状
- * 四件事被三处同时用到——外壳（渲染导航）、`/settings/<tab>` 的 8 个路由目录、
+ * 四件事被三处同时用到——外壳（渲染导航）、`/settings/<tab>` 的 10 个路由目录、
  * 以及 `server/tests/test_settings_tabs.py`（断言「清单里的每一项都有真实存在的
  * 路由目录」）。任何一处写死一份副本，都会在下次加 Tab 时静默漂移：加了名字却
  * 没有目录 → 点进去 404；有了目录却不在清单里 → 导航上看不见。所以只留一份，
@@ -23,6 +23,9 @@ export const SETTINGS_TABS = [
   'tokens',
   'restock',
   'system',
+  // 「页面监控」也归在运维这一组：它盯的是上游网页的改版与活动入口，
+  // 和「系统更新 / 数据备份」回答的是同一类问题——「有没有事情需要我看一眼」。
+  'watchdog',
   // 「数据备份」紧挨「系统更新」：两件事都属于「这台机器上的运维」，
   // 而且都在回答同一个问题——「我的东西会不会丢」。
   'backup',
@@ -62,6 +65,7 @@ export const SETTINGS_TAB_LABEL_KEYS: Record<SettingsTab, string> = {
   tokens: 'settings.tabTokens',
   restock: 'restock.tabLabel',
   system: 'settings.tabSystem',
+  watchdog: 'settings.tabWatchdog',
   backup: 'settings.tabBackup',
   changelog: 'settings.tabChangelog',
   about: 'settings.tabAbout',

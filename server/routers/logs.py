@@ -6,8 +6,20 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 
 from .. import db, keysvc, security
+from ..services import accountlog
 
 router = APIRouter(prefix='/api/logs', tags=['logs'])
+
+
+@router.get('/account-backfill')
+def account_backfill(user: dict = Depends(security.require_admin)) -> dict:
+    """账号列的来源自诊断（issue #232）。
+
+    请求日志的「账号」是从**上游运行日志**回填的，面板转发时并不知道用了哪个号。
+    这一列空的时候有四种完全不同的原因（模式配错 / 日志路径错 / 上游改了行格式 /
+    时间对不上），靠猜只能来回要现场信息。这里把事实直接给出来。
+    """
+    return accountlog.status()
 
 
 @router.get('')
@@ -103,6 +115,10 @@ def list_logs(
             # 账号是采集上游日志后按时间对回来的，比请求本身晚几秒，
             # 所以刚打完的请求这一列可能是空的（界面显示「—」，刷新即可）。
             'account': r['account'],
+            # 思考强度（reasoning_effort）：客户端显式传的档位；NULL=没传/旧记录。
+            'effort': r['effort'],
+            # 客户端渠道（issue #233）：UA 归类；NULL=该列上线前的旧记录。
+            'channel': r['channel'],
             # 输入侧命中缓存的 token 数。NULL 与 0 含义不同：
             # NULL = 上游没给这个字段，0 = 这次确实没命中（见 db 的列说明）。
             'cache_hit_tokens': r['cache_hit_tokens'],

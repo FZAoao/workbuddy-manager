@@ -6,7 +6,7 @@
  * 或走 Python 包装：`python -m unittest server.tests.test_settings_tabs`
  * （没有 node 时那条会 skip，不会阻塞后端测试套件）。
  *
- * 为什么值得单独测：这份清单是**四处共用的单一事实来源**——二级导航、8 个路由
+ * 为什么值得单独测：这份清单是**四处共用的单一事实来源**——二级导航、10 个路由
  * 目录、重定向的落点、以及路径解析。错起来界面不会报错，只会「点进去 404」或者
  * 「地址栏是 models、内容是 users」：
  *   · 解析多认一段（`/settings/models/extra` 也算 models）→ 一条不存在的 URL 会
@@ -39,9 +39,10 @@ function check(name, got, want) {
 /* ── 清单本身 ─────────────────────────────────────────────────── */
 
 check(
-  '清单就是这 9 项（保留 fork 补货链接），顺序固定（导航顺序 = 路由顺序 = i18n 键顺序）',
+  '清单就是这 11 项（含 fork 的补货链接），顺序固定（导航顺序 = 路由顺序 = i18n 键顺序）',
   SETTINGS_TABS,
-  ['upstream', 'proxy', 'models', 'users', 'tokens', 'restock', 'system', 'backup', 'changelog', 'about'],
+  ['upstream', 'proxy', 'models', 'users', 'tokens', 'restock', 'system', 'watchdog',
+   'backup', 'changelog', 'about'],
 );
 
 check('清单里没有重复项', new Set(SETTINGS_TABS).size, SETTINGS_TABS.length);

@@ -5,6 +5,13 @@ import {Play, Square, Eye, Gift, Sparkles, Loader2, TriangleAlert, GraduationCap
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -12,6 +19,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/animate-ui/radix/dialog';
+import {useAsyncAll} from '@/lib/use-async-data';
+import {upstreamsApi} from '@/lib/api';
 import {useI18n} from '@/lib/i18n/provider';
 import {RichText} from '@/lib/i18n/rich-text';
 import {translateRunLine} from '@/lib/i18n/taskrun';
@@ -35,9 +44,17 @@ export function TaskRunnerPanel() {
   const [confirmFull, setConfirmFull] = useState(false);
   /** 开学季二次确认：'school'（做任务）或 'school-lottery'（只抽奖） */
   const [confirmSchool, setConfirmSchool] = useState<'school' | 'school-lottery' | null>(null);
+  /**
+   * 目标分组（issue #274）：null = 默认分组。只有配置了本地账号目录的分组
+   * 才能跑任务 —— 没有目录的分组只做密钥转发，脚本没有账号可读。
+   */
+  const [groupId, setGroupId] = useState<number | null>(null);
+  const groupList = useAsyncAll({groups: () => upstreamsApi.list()}, []);
+  const groups = groupList.values.groups?.items ?? [];
+  const runnableGroups = groups.filter((g) => g.auth_dir);
   // 状态轮询与「开始 / 停止」都在 use-task-run 里（任务页面板与账号页单号弹窗共用
-  // 同一份策略：运行中 2 秒、空闲 15 秒）。这里只管开学季这两个模式自己的确认弹窗。
-  const {status, busy, run, stop} = useTaskRun({target: 'ALL'});
+  // 同一份策略：运行中 2 秒、空闲 15 秒）；分组与开学季模式都从这里透传下去。
+  const {status, busy, run, stop} = useTaskRun({target: 'ALL', upstreamId: groupId});
 
   const running = status?.running === true;
   const unavailable = status && !status.available;
@@ -54,10 +71,30 @@ export function TaskRunnerPanel() {
             <Badge variant="secondary" className="rounded-full text-[10px]">
               <Loader2 className="mr-1 size-3 animate-spin" />
               {t('tasks.runRunning', {mode: t(`tasks.runMode_${status?.mode}`)})}
+              {status?.group ? ` · ${status.group}` : ''}
             </Badge>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {/* 分组选择：与账号页的切换条同义。运行中不允许切（任务全局单例）。 */}
+          <Select
+            value={groupId == null ? 'default' : String(groupId)}
+            onValueChange={(v) => setGroupId(v === 'default' ? null : Number(v))}
+            disabled={running}
+          >
+            <SelectTrigger
+              className="h-8 w-[150px] rounded-full"
+              aria-label={t('tasks.runGroup')}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="default">{t('accounts.groupDefault')}</SelectItem>
+              {runnableGroups.filter((g) => !g.is_default).map((g) => (
+                <SelectItem key={String(g.id)} value={String(g.id)}>{g.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           {/* 预览：只读，无风险 */}
           <Button variant="ghost" size="sm" className="h-8 rounded-full"
                   disabled={busy || running || !!unavailable}

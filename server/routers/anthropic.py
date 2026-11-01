@@ -1001,6 +1001,13 @@ async def messages(request: Request):
         gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
         return _err(f'请求转换失败：{exc}')
 
+    # 思考档位（issue #319）：客户端选了档位，日志里却一直是「—」，因为只有
+    # chat 路径把 reasoning_effort 传给了 _record。这里从**已转换的 payload**
+    # 取——to_openai_request 已经把 Anthropic 的 output_config / thinking
+    # 映射成上游的 reasoning_effort，取它才是「这次真正发出去的值」。
+    effort = payload.get('reasoning_effort')
+    effort = effort.strip()[:16] if isinstance(effort, str) and effort.strip() else None
+
     if mapped:
         payload['model'] = mapped
     if stream:
@@ -1036,7 +1043,7 @@ async def messages(request: Request):
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                usage=usage,
+                usage=usage, effort=effort,
             )
             if resp.status_code >= 400:
                 msg = ''
@@ -1176,7 +1183,7 @@ async def messages(request: Request):
                 key, ip, model, mapped or '', status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                usage=usage, first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms, effort=effort,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

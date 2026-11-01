@@ -1,6 +1,6 @@
 """命令面板（⌘K，批次 5 ③）—— 行为测试借 Node 执行，结构不变式在源码上断言。
 
-为什么值得有：这一批给「11 个业务页 + 设置页 7 个 Tab」加了一条键盘入口。做错了
+为什么值得有：这一批给「11 个业务页 + 设置页 10 个 Tab」加了一条键盘入口。做错了
 **界面不报错**，只是那一项静默地到不了 / 到错地方：
 
   · 面板里漏了一项 → 那页从此只能靠底栏点进去，而 ⌘K 看起来一切正常；
@@ -48,11 +48,10 @@ _NODE = shutil.which('node')
 # 只跑 .mjs，不碰 .ts —— Node 的 type stripping 从 22.6 起才有
 _MIN_MAJOR = 22
 
-# 面板里的条目数：底栏 8 个目的地 + 被吸收的 3 页 + 设置页 9 个 Tab（含代理）。
+# 面板里的条目数：底栏 8 个目的地 + 被吸收的 3 页 + 设置页 10 个 Tab（含代理与监控）。
 # 写死是**有意**的：数量变了说明有人加了页面却没想清楚它该出现在哪，
 # 那一步值得被问一句。三处来源的并集也在同一条断言里交叉核对。
-# 底栏 9 + 二级导航 6 + 设置页 10 = 22（含本分支的「补货链接」与「中奖记录」等入口）。
-_EXPECTED_TOTAL = 22
+_EXPECTED_TOTAL = 23
 
 # 必须渲染出来的定位标记。验收脚本按它们断言；少一个就有一条断言恒真。
 _REQUIRED_SLOTS = (
@@ -196,9 +195,9 @@ class CommandPaletteInvariantTest(unittest.TestCase):
             f'从 section-nav.ts 里解析出 {len(self.sections)} 项（期望 6）：{self.sections}',
         )
         self.assertEqual(
-            len(self.settings), 10,
-            f'从 settings-tabs.ts 里解析出 {len(self.settings)} 个 Tab（期望 10 —— '
-            f'上游 9 个加本分支的补货链接）：{self.settings}',
+            len(self.settings), 11,
+            f'从 settings-tabs.ts 里解析出 {len(self.settings)} 个 Tab（期望 11 —— '
+            f'上游 10 个加本分支的补货链接）：{self.settings}',
         )
         self.assertGreaterEqual(
             len(self.entries), _EXPECTED_TOTAL,

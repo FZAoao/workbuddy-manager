@@ -1,4 +1,4 @@
-"""设置页 8 个 Tab 的可寻址子路由（批次 4 的 P1-2）+ 结构不变式。
+"""设置页 10 个 Tab 的可寻址子路由（批次 4 的 P1-2）+ 结构不变式。
 
 为什么值得有：这一批把「一页 2060 行的单页」改成 `/settings/<tab>`，做错了**界面
 不报错**，只是行为悄悄变差——
@@ -39,9 +39,9 @@ _VERIFY = _ROOT / 'dev' / 'verify_state_honesty.mjs'
 _LOCALES = _ROOT / 'web' / 'lib' / 'i18n' / 'locales'
 _NODE = shutil.which('node')
 
-# 上游 9 个 Tab（含 2.x 新增的「出口线路」）加上本分支的补货链接入口。
+# 上游 10 个 Tab（含 2.x 的「出口线路」与 2.11 的「页面监控」）加上本分支的补货链接。
 # 多一个少一个都要有人主动改这里（以及 CHANGELOG）。
-_TAB_COUNT = 10
+_TAB_COUNT = 11
 
 # 只跑 .mjs，不碰 .ts —— Node 的 type stripping 从 22.6 起才有
 _MIN_MAJOR = 22
@@ -188,7 +188,7 @@ class SettingsTabsInvariantTest(unittest.TestCase):
         )
 
     def test_route_pages_render_nothing(self) -> None:
-        """7 个子路由的 page **不渲染内容**，内容由外壳渲染。
+        """10 个子路由的 page **不渲染内容**，内容由外壳渲染。
 
         这不是疏忽，而是本批次的核心取舍：切 Tab 是一次路由跳转，App Router 会重挂载
         page，而设置页的表单状态（配置副本、乐观值、改动基线）必须活过这次跳转。
