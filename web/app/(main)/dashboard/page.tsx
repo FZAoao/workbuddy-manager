@@ -56,6 +56,7 @@ import {
   degradedCount,
   interleave,
   poolTotals,
+  partitionCredits,
   tagGroup,
   type AvailabilityTier,
   type GroupedAccount,
@@ -65,6 +66,7 @@ import {cn} from '@/lib/utils';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard, type StatTone} from '@/components/common/layout/StatCard';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
+import {AccountRiskWarnings} from '@/components/common/accounts/AccountRiskWarnings';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
@@ -350,7 +352,7 @@ export default function DashboardPage() {
   /** 可用性分档的汇总（只统计「能正常调用」的，与账号页说法一致） */
   const availability = useMemo(() => {
     const counts: Record<AvailabilityTier, number> = {
-      disabled: 0, disabledByPanel: 0, manualDisabled: 0, expired: 0, unknown: 0, cooling: 0,
+      disabled: 0, disabledByPanel: 0, manualDisabled: 0, riskPaused: 0, expired: 0, unknown: 0, cooling: 0,
       neverSucceeded: 0, notLoaded: 0, online: 0,
     };
     for (const a of scoped) counts[availabilityOf(a)] += 1;
@@ -375,10 +377,10 @@ export default function DashboardPage() {
   const expiring = scoped.filter((a) => a.remain_seconds > 0 && a.remain_seconds < 3600).length;
   // 积分余额合计（仅统计已同步到的账号）
   // 优先用实时查询到的积分，其次上游 /status 的（可能滞后的）值
-  const credOf = (a: GroupedAccount) => liveCredits[a.uid] ?? a.credits;
+  const credOf = (a: {uid: string; credits?: number | null}) => liveCredits[a.uid] ?? a.credits;
   const creditsKnown = scoped.filter((a) => typeof credOf(a) === 'number');
-  const totalCredits = creditsKnown.reduce((sum, a) => sum + (credOf(a) || 0), 0);
-  const creditsLow = creditsKnown.filter((a) => (credOf(a) || 0) < 200).length;
+  const creditTotals = useMemo(() => partitionCredits(scoped, liveCredits), [scoped, liveCredits]);
+  const creditsLow = creditTotals.usableAccounts.filter((a) => typeof credOf(a) === 'number' && (credOf(a) || 0) < 200).length;
   /**
    * 当前版本账号的到期明细（按时刻升序）。
    *
@@ -392,8 +394,8 @@ export default function DashboardPage() {
    * 刷新时元数据变，两边都可能单独发生。
    */
   const scopedExpiries = useMemo(
-    () => collectScopedExpiries(scoped, creditsMeta),
-    [scoped, creditsMeta],
+    () => collectScopedExpiries(creditTotals.usableAccounts, creditsMeta),
+    [creditTotals, creditsMeta],
   );
   /** 最近一笔：升序后的第一条。按天归并关着时卡片就显示它。 */
   const nextExpiry = scopedExpiries[0] ?? null;
@@ -481,6 +483,7 @@ export default function DashboardPage() {
   return (
     <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
       {header}
+      <AccountRiskWarnings allGroups />
 
       {/* 统计范围。**只在多于一个分组时才出现**：单分组时它只是句废话，
           而绝大多数部署就是单分组。有了它，用户才知道上面那些数是全池的，
@@ -555,12 +558,22 @@ export default function DashboardPage() {
           delay={0.1}
         />
         <StatCard
-          label={t('metric.credits')}
+          label={t('dashboard.availableCredits')}
           {...acctCard(
             // 值里带上最近一笔到期：额度高但下周作废，比额度低更值得注意
-            <span className="inline-flex items-baseline gap-1.5">
-              <span>{creditsKnown.length ? fmtNumber(totalCredits) : '—'}</span>
-              <CreditCountdown expiries={expiryShown} />
+            <span className="flex flex-col gap-1.5" title={t('dashboard.creditAvailabilityHint')}>
+              <span className="inline-flex flex-wrap items-baseline gap-1.5">
+                <span>{creditTotals.known ? fmtNumber(creditTotals.available) : '—'}</span>
+                <CreditCountdown expiries={expiryShown} />
+              </span>
+              <span className="text-xs font-medium tracking-normal text-muted-foreground">
+                {t('dashboard.unavailableCredits')}: {creditTotals.known ? fmtNumber(creditTotals.unavailable) : '—'}
+              </span>
+              {creditTotals.unknown > 0 && (
+                <span className="text-[11px] font-normal tracking-normal text-muted-foreground">
+                  {t('dashboard.creditsUnknown', {n: creditTotals.unknown})}
+                </span>
+              )}
             </span>,
             // 优先级：先报「余额快见底」（这是原有的告警，不能被新信息顶掉），
             // 其次报最近一笔到期（具体日期与金额，只有这里能看到），
@@ -574,7 +587,7 @@ export default function DashboardPage() {
                       time: fmtDateTime(expiryShown[0].at),
                       amount: fmtNumber(expiryShown[0].amount),
                     })
-                  : t('dashboard.creditsCovered', {count: creditsKnown.length, n: creditsKnown.length}),
+                  : t('dashboard.creditsCovered', {count: creditTotals.known, n: creditTotals.known}),
             !creditsKnown.length ? 'neutral' : creditsLow > 0 || expiryUrgent ? 'warning' : 'accent',
             creditsLow > 0 || expiryUrgent ? 'warning' : undefined,
           )}
@@ -857,6 +870,12 @@ export default function DashboardPage() {
                           borderRadius: 12,
                           fontSize: 12,
                         }}
+                        /* 与柱状图同一口径：Recharts 默认把原始浮点数直接塞进提示框，
+                           支出是 usage.credit 的累加，会显示成 10 位小数（issue #365）。 */
+                        formatter={(value, name) => {
+                          const n = Number(value);
+                          return [fmtNumber(n), String(name)] as [string, string];
+                        }}
                       />
                       <Legend wrapperStyle={{fontSize: 11}} />
                       <Line yAxisId="inc" type="monotone" dataKey="income"
@@ -916,7 +935,7 @@ export default function DashboardPage() {
               // 与剩余天数如实呈现，两者不再混在一起说。
               const tier = availabilityOf(a);
               const statusLabel = t(availabilityLabelKey(tier, a));
-              const titleKey = availabilityTitleKey(tier);
+              const titleKey = availabilityTitleKey(tier, a);
               return (
                 // key **必须带分组**：两个分组可以有同名账号文件，只用 a.file
                 // 会让两条撞成一条（见 accountKey 的注释）。

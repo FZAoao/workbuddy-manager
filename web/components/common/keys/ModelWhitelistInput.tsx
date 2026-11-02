@@ -2,7 +2,7 @@
 
 import {useMemo, useState} from 'react';
 import {Check, ChevronsUpDown, Search, X} from 'lucide-react';
-import {modelApi} from '@/lib/api';
+import {accountApi, modelApi} from '@/lib/api';
 import type {CatalogModel} from '@/lib/types';
 import type {Realm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -57,7 +57,7 @@ export function ModelWhitelistInput({
   const [draft, setDraft] = useState('');
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [catalog, setCatalog] = useState<{cn: CatalogModel[]; global: CatalogModel[]} | null>(null);
+  const [catalog, setCatalog] = useState<{cn: CatalogModel[]; global: CatalogModel[]; realms: Set<Realm> | null} | null>(null);
   /** 只看上游标注为「限时免费」的模型（issue #208）；tags 缺失时按不在免费目录处理 */
   const [freeOnly, setFreeOnly] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -84,11 +84,17 @@ export function ModelWhitelistInput({
     try {
       // 用模型目录而不是 /api/models：只有目录条目带 tags（含「限时免费」），
       // 白名单的免费筛选依赖它。目录有后端缓存，打开弹窗时拉一次即可。
-      const [cn, global] = await Promise.all([
+      const [cn, global, accounts] = await Promise.all([
         modelApi.catalog('cn'),
         modelApi.catalog('global'),
+        // 没有配置国际版账号时，选择器里不该冒出一堆用不了的国际版模型
+        // （issue #364）。账号列表取不到就退回「两组都显示」，不挡住手输。
+        accountApi.list().catch(() => null),
       ]);
-      setCatalog({cn: cn.models, global: global.models});
+      const realms = accounts
+        ? new Set<Realm>(accounts.accounts.map((a) => (a.realm === 'global' ? 'global' : 'cn')))
+        : null;
+      setCatalog({cn: cn.models, global: global.models, realms});
     } catch {
       setFailed(true);
     }
@@ -98,12 +104,21 @@ export function ModelWhitelistInput({
   const isFree = (m: CatalogModel) => (m.tags || []).some((tag) => tag.includes('免费'));
   const groups: {key: Realm; label: string; models: CatalogModel[]}[] = [];
   if (catalog) {
-    groups.push({key: 'cn', label: t('realm.cn'), models: catalog.cn});
-    groups.push({key: 'global', label: t('realm.global'), models: catalog.global});
+    const hasAccounts = (r: Realm) => !catalog.realms || catalog.realms.has(r);
+    if (hasAccounts('cn')) groups.push({key: 'cn', label: t('realm.cn'), models: catalog.cn});
+    if (hasAccounts('global')) {
+      groups.push({key: 'global', label: t('realm.global'), models: catalog.global});
+    }
     // 排序要就地进行：写成 `[...].sort(...)` 会让 TS 把字面量的 key 推宽成 string，
     // 整个数组就不再是声明的那个类型（tsc 报过）。
     groups.sort((a, b) => (a.key === realm ? -1 : b.key === realm ? 1 : 0));
   }
+  // 国际版条目在目录里是裸名（目录按版本取），但调用时必须带 `global:` 前缀
+  // 才能路由到国际版账号池；白名单是按**请求里的实际名字**比对的。存裸名会出现
+  // 「列表里能选、一调用就 400 不在白名单内」（issue #357），所以勾选时存限定名。
+  // 密钥已锁定版本时后端会把两种前缀都归一，带不带前缀都能用。
+  const qualified = (realm: Realm, id: string) =>
+    realm === 'global' && !id.toLowerCase().startsWith('global:') ? `global:${id}` : id;
   const needle = query.trim().toLowerCase();
   const filtered = groups
     .map((g) => ({
@@ -218,7 +233,7 @@ export function ModelWhitelistInput({
               {freeOnly && filtered.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => emit([...names, ...filtered.flatMap((g) => g.models.map((m) => m.id))])}
+                  onClick={() => emit([...names, ...filtered.flatMap((g) => g.models.map((m) => qualified(g.key, m.id)))])}
                   className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
                 >
                   {t('keys.freeSelectAll')}
@@ -245,14 +260,15 @@ export function ModelWhitelistInput({
                 <div key={group.key} className="mb-1">
                   <div className="px-2 py-1 text-[11px] text-muted-foreground">{group.label}</div>
                   {group.models.map((m) => {
-                    const picked = names.includes(m.id);
+                    const value = qualified(group.key, m.id);
+                    const picked = names.includes(value);
                     return (
                       <button
                         key={m.id}
                         type="button"
                         role="checkbox"
                         aria-checked={picked}
-                        onClick={() => (picked ? remove(m.id) : add(m.id))}
+                        onClick={() => (picked ? remove(value) : add(value))}
                         className={cn(
                           'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs',
                           'hover:bg-muted',

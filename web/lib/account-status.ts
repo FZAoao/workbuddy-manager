@@ -39,6 +39,7 @@ export type AvailabilityTier =
   | 'disabledByPanel'
   /** 上游手动停用位（issue #45）：还在池里、任务照常，只是不被选中转发 */
   | 'manualDisabled'
+  | 'riskPaused'
   | 'expired'
   /** 本次读不到上游状态，运行时字段全部未知（`upstream.connected !== true`） */
   | 'unknown'
@@ -89,6 +90,7 @@ export function mergePoolStatus(
       // 上游的手动停用状态位（issue #45）。取的是**这份快照**的值——用户点了
       // 停用后状态位由上游持有，本页靠心跳拿到新值；不取的话徽章要等下次整页
       // 刷新才更新，点了按钮看着没反应。
+      refresh_risk: (p.refresh_risk as Account['refresh_risk']) ?? null,
       manual_disabled: typeof p.manual_disabled === 'boolean' ? p.manual_disabled : null,
       manual_reason: typeof p.manual_reason === 'string' ? p.manual_reason : '',
       in_flight: typeof p.in_flight === 'number' ? p.in_flight : null,
@@ -187,6 +189,7 @@ export function availabilityGroup(tier: AvailabilityTier): AvailabilityGroup {
     case 'manualDisabled':
       return 'stopped';
     case 'disabled':
+    case 'riskPaused':
     case 'expired':
     case 'neverSucceeded':
     case 'notLoaded':
@@ -225,6 +228,8 @@ export function availabilityOf(a: Account): AvailabilityTier {
   // **还在池里**，签到与保活照常，所以文案必须与改名那条区分开。
   if (a.manual_disabled === true) return 'manualDisabled';
   if (a.disabled === true) return 'disabled';
+  if (a.poolUnknown) return 'unknown';
+  if (a.refresh_risk?.needs_review || (a.refresh_risk?.until ?? 0) * 1000 > Date.now()) return 'riskPaused';
   if (a.is_expired) return 'expired';
   // 「看不到上游」必须早于「不在池里」：否则会把正常账号说成文件损坏
   if (a.poolUnknown) return 'unknown';
@@ -244,18 +249,56 @@ export function availabilityOf(a: Account): AvailabilityTier {
  * 分档对应的文案键。**两页共用同一套文案**——这正是为了让两处说法逐字一致；
  * 各写各的字符串，迟早又会出现「一个叫在线、一个叫正常」这种漂移。
  */
+/** 11140 也用于模型限流；只按封禁语义判断，不能只看错误码。 */
+export function isAccountBanned(a?: Account): boolean {
+  const reason = String(a?.disabled_reason || '');
+  if (a?.disabled !== true || /11128|11-128|channel check|渠道校验/i.test(reason)) return false;
+  return /账号存在异常行为|已被限制使用/.test(reason)
+    || (/\b11140\b/.test(reason) && /request illegal|account banned/i.test(reason));
+}
+
+export function needsRelogin(a: Account): boolean {
+  return availabilityOf(a) === 'disabled' && !isAccountBanned(a);
+}
+
+export function disabledReasonText(a: Account): string {
+  const reason = String(a.disabled_reason || '');
+  return isAccountBanned(a) ? reason.replace(/,?\s*re-login required\.?/gi, '') : reason;
+}
+
+/** 同一 uid 跨组只算一次；任一组可用时，其余额归入可用部分。 */
+export function partitionCredits(accounts: readonly Account[], live: Record<string, number>) {
+  const unique = new Map<string, Account>();
+  const isUsable = (a: Account) => availabilityOf(a) === 'online' && a.healthy !== false;
+  for (const a of accounts) {
+    if (!unique.has(a.uid) || isUsable(a)) unique.set(a.uid, a);
+  }
+  let available = 0, unavailable = 0, known = 0, unknown = 0;
+  const usableAccounts: Account[] = [];
+  for (const a of unique.values()) {
+    const usable = isUsable(a);
+    if (usable) usableAccounts.push(a);
+    const balance = live[a.uid] ?? a.credits;
+    if (typeof balance !== 'number' || !Number.isFinite(balance)) { unknown += 1; continue; }
+    known += 1;
+    if (usable) available += balance;
+    else unavailable += balance;
+  }
+  return {available, unavailable, total: available + unavailable, known, unknown, usableAccounts};
+}
+
 export function availabilityLabelKey(tier: AvailabilityTier, a?: Account): string {
   switch (tier) {
     case 'disabled':
-      // 上游对 11140（request illegal）是硬禁用、到期也不自愈，必须重新登录；
-      // 只说「已禁用」会让人干等。
-      return /11140|request illegal/i.test(String(a?.disabled_reason || ''))
-        ? 'accounts.badgeDisabledRelogin'
+      return isAccountBanned(a)
+        ? 'accounts.badgeBanned'
         : 'accounts.badgeDisabled';
     case 'disabledByPanel':
       return 'accounts.badgeDisabledByPanel';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabled';
+    case 'riskPaused':
+      return a?.refresh_risk?.needs_review ? 'risk.review' : 'risk.paused';
     case 'expired':
       return 'accounts.badgeExpired';
     case 'unknown':
@@ -275,7 +318,7 @@ export function availabilityLabelKey(tier: AvailabilityTier, a?: Account): strin
 }
 
 /** 需要解释「为什么是这个状态」时对应的提示键；没有可解释的返回 null。 */
-export function availabilityTitleKey(tier: AvailabilityTier): string | null {
+export function availabilityTitleKey(tier: AvailabilityTier, a?: Account): string | null {
   switch (tier) {
     case 'unknown':
       return 'accounts.badgeUnknownTitle';
@@ -289,11 +332,13 @@ export function availabilityTitleKey(tier: AvailabilityTier): string | null {
       return 'accounts.badgeDisabledByPanelTitle';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabledTitle';
+    case 'riskPaused':
+      return 'risk.recovery';
     // 系统自动禁用（12153 连败 / 11140 被封）必须给出**下一步**：只说「已禁用」
     // 用户不知道能做什么。点「启用」现在会连同系统禁用位一起解除（面板会调上游
     // 的 revive 端点）——这一点以前不成立，所以老提示只能写「重新登录」。
     case 'disabled':
-      return 'accounts.badgeDisabledTitle';
+      return isAccountBanned(a) ? 'accounts.bannedHint' : 'accounts.badgeDisabledTitle';
     default:
       return null;
   }
@@ -313,6 +358,7 @@ export function availabilityClass(tier: AvailabilityTier): string {
     case 'unknown':
       return 'text-muted-foreground';
     case 'cooling':
+    case 'riskPaused':
       return 'text-amber-600 dark:text-amber-400';
     case 'neverSucceeded':
     case 'notLoaded':

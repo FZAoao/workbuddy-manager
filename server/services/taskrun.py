@@ -47,6 +47,7 @@ import time
 from pathlib import Path
 
 from .. import config, db
+from . import taskpacing
 from .errtext import err_text
 from .task_summary import summarize as summarize_tasks
 
@@ -424,7 +425,11 @@ def build_command(mode: str, target: str) -> list[str]:
     # 通过面板自带的兼容 runner 启动：它不改上游协议，只对 list_tasks 的
     # 临时网络失败做有限重试，并在重试耗尽时跳过当前任务而不是让整轮崩溃。
     runner = Path(__file__).with_name('taskscript.py')
-    return [_python(), '-u', str(runner), str(script), target, *_MODE_ARGS[mode]]
+    # 账号错峰（taskpacing）只对成长任务的两个模式传：参数是 `task_runner.py`
+    # 认识的 `--account-delay-*`，开学季是另一套脚本，传过去会被当成未知参数。
+    pacing = taskpacing.script_args() if mode in ('claim', 'full') else []
+    return [_python(), '-u', str(runner), str(script), target,
+            *_MODE_ARGS[mode], *pacing]
 
 
 def _prepare(mode: str, target: str, auth_dir: Path | str | None = None,
@@ -499,6 +504,10 @@ async def start_async(mode: str, target: str = 'ALL',
 
     `auth_dir` / `group_name` 用于多分组（issue #274）：不传 = 默认分组。
     """
+    from . import accountrisk
+    paused = await accountrisk.paused_targets(auth_dir)
+    if paused and (target == 'ALL' or any(uid.startswith(target) for uid in paused)):
+        return False, '账号存在保护性暂停；请改选正常账号单独执行，或检查预警后手动恢复'
     ok, payload = await asyncio.to_thread(_prepare, mode, target, auth_dir, group_name)
     if not ok:
         return False, payload  # type: ignore[return-value]
@@ -527,6 +536,12 @@ def start(mode: str, target: str = 'ALL',
 async def _run(argv: list[str], mode: str, target: str,
                auth_dir: str = '', group: str = '') -> None:
     """跑子进程并把输出累积到状态里（尾部保留）。"""
+    from . import accountrisk
+    paused = await accountrisk.paused_targets(auth_dir)
+    if paused and (target == 'ALL' or any(uid.startswith(target) for uid in paused)):
+        _state.update(running=False, finished_at=int(time.time()), exit_code=1,
+                      error='账号存在保护性暂停，未执行批量活动脚本')
+        return
     env = dict(os_environ())
     # 显式指定账号目录：脚本自身的回落顺序（WB2A_AUTHS > 仓库内 auths/ >
     # /root/...）不一定指向本面板管的那批文件，传错会「跑了个寂寞」还看不出来。
@@ -552,6 +567,10 @@ async def _run(argv: list[str], mode: str, target: str,
     cwd = str(script_path.parent.parent)
 
     proc = None
+    # A configured account gap can exceed the usual five-minute idle timeout.
+    idle_timeout = IDLE_TIMEOUT_SECONDS
+    if taskpacing.is_scheduled():
+        idle_timeout = max(idle_timeout, taskpacing.delay_bounds()[1] + 30)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, env=env,
@@ -571,7 +590,7 @@ async def _run(argv: list[str], mode: str, target: str,
                     raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)
                 except asyncio.TimeoutError:
                     idle = time.time() - last_seen
-                    if idle > IDLE_TIMEOUT_SECONDS:
+                    if idle > idle_timeout:
                         raise _Stalled(idle)
                     if time.time() - started > MAX_TOTAL_SECONDS:
                         raise _Stalled(time.time() - started, total=True)
@@ -882,7 +901,8 @@ async def _claim_loop() -> None:
                             # 必须 await 线程池版本：start() 里的 available()
                             # 可能 fork docker（脚本缺失时），在事件循环里同步跑
                             # 会冻住整个服务连同对外网关。
-                            await start_async('claim', 'ALL')
+                            with taskpacing.scheduled_execution():
+                                await start_async('claim', 'ALL')
         except Exception as exc:  # noqa: BLE001
             logger.warning('定时领奖检查失败: %s', exc)
         await asyncio.sleep(_CLAIM_TICK_SECONDS)

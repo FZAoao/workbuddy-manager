@@ -220,7 +220,11 @@ def create_key(
     *,
     _conn: sqlite3.Connection | None = None,
 ) -> dict:
-    """创建一个密钥。返回含**明文 token** 的字典（库里只存哈希）。
+    """创建一个密钥。返回含**明文 token** 的字典。
+
+    明文**存两份**：`key_hash`（网关校验用，明文永不参与比对）与 `key_plain`
+    （管理端「再次查看 / 复制」用，见 `reveal_key`）。为什么后者也存、代价是什么，
+    写在 db.py 那张表的列注释里。
 
     `_conn`：传入一个**已开启事务**的连接时，本函数在它上面执行且**不自行提交**，
     由调用方负责 commit/rollback。红包（`redpacket.create_packet`）用它来保证
@@ -231,12 +235,14 @@ def create_key(
     改一处漏一处——本项目在 count_tokens 的鉴权上正是这么漂移出真漏洞的。
     """
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
-    sql = ('INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
-           'ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, '
-           'created_at, upstream_id) VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)')
+    sql = ('INSERT INTO api_keys(name, key_hash, key_plain, prefix, enabled, expires_at, '
+           'max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, '
+           'used_credit, created_at, upstream_id) '
+           'VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)')
     args = (
         name,
         _hash(token),
+        token,
         token[:12],
         expires_at,
         max_ips,
@@ -255,8 +261,32 @@ def create_key(
         key_id = db.execute(sql, args)
         row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
     out = _parse(row)
-    out['key'] = token  # 仅此一次返回明文
+    out['key'] = token  # 创建响应里直接给出，界面不必再调一次 reveal
     return out
+
+
+def reveal_key(key_id: int) -> dict | None:
+    """取回一把密钥的明文（供「再复制一次」）。密钥不存在返回 None。
+
+    `key` 为空串 = 取不回来（存量密钥，那时只存哈希）；判断归调用方，因为
+    「取不回来」与「没有这把密钥」要给两种不同的提示（409 / 404）。
+
+    **这是唯一输出明文的地方**（除创建响应之外）——列表、日志、审计都不能带它。
+    红包密钥有兜底：它们创建时就把明文写进了 `red_packet_shares.token`
+    （见 db.py 那张表），所以即便 `key_plain` 是空的也能从那里取回 —— 否则
+    「红包发的密钥取不回、手工建的能取回」会让人以为功能坏了。
+    """
+    row = db.query_one('SELECT id, name, prefix, key_plain FROM api_keys WHERE id = ?',
+                       (key_id,))
+    if not row:
+        return None
+    plain = str(row['key_plain'] or '')
+    if not plain:
+        share = db.query_one("SELECT token FROM red_packet_shares WHERE key_id = ? "
+                             "AND token <> '' LIMIT 1", (key_id,))
+        plain = str(share['token']) if share else ''
+    return {'id': row['id'], 'name': row['name'] or '', 'prefix': row['prefix'] or '',
+            'key': plain}
 
 
 def update_key(key_id: int, patch: dict) -> dict | None:
@@ -358,8 +388,44 @@ def model_allowed(key: dict, model: object) -> bool:
     # （另一版本根本进不来），两边都按裸名比。否则会出现一种死锁（issue #255）：
     # 国际版密钥的白名单写裸名 `deepseek-v4.1-flash`，客户端按界面提示加
     # `global:` 前缀调用，反而被白名单拒掉；不加前缀又被版本校验拒掉。
-    norm = _strip_realm_prefix if _norm_realm(key.get('realm')) else _bare_model
-    return norm(model) in {norm(x) for x in allow}
+    want = _norm_realm(key.get('realm'))
+    if want:
+        # 版本已被密钥锁死：前缀不再承担路由信息（另一版本根本进不来），
+        # 两边都按裸名比（issue #255 的死锁）。
+        return (_strip_realm_prefix(str(model))
+                in {_strip_realm_prefix(str(x)) for x in allow})
+
+    # 未锁定版本：**显式前缀只匹配同版本，裸名视为「不限版本」**。
+    #
+    # 裸名当通配符是 issue #357 的修法：密钥编辑器按版本分组展示模型，国际版
+    # 那一组给的是**裸名**（目录本身就是按版本取的），勾选后存进白名单的也是
+    # 裸名；而客户端调用时要带 `global:` 前缀才能路由到国际版账号池。严格的
+    # 字面比对让这两条路互相堵死——列表里能选、一调用就 400「不在白名单内」。
+    # 裸名没有携带版本信息，把它解释成「这个模型的任意版本」才是用户的意图；
+    # 想只放行某一版，写 `cn:` / `global:` 前缀即可（编辑器现在也会带前缀）。
+    req_realm, req_bare = _split_realm(model)
+    req_realm = req_realm or 'cn'  # 裸名默认国内版，与上游路由口径一致
+    for entry in allow:
+        entry_realm, entry_bare = _split_realm(entry)
+        if entry_bare != req_bare:
+            continue
+        if not entry_realm or entry_realm == req_realm:
+            return True
+    return False
+
+
+def _split_realm(model: object) -> tuple[str, str]:
+    """把模型名拆成（版本, 裸名）；不带前缀返回 `('', 原名)`。
+
+    与 `_bare_model` 的区别：这里把两种前缀都拆出来，供白名单**按版本比对**；
+    `_bare_model` 只去 `cn:`，保留 `global:` 参与字面比对。
+    """
+    m = str(model or '').strip()
+    low = m.lower()
+    for pref in ('cn:', 'global:'):
+        if low.startswith(pref):
+            return pref[:-1], m[len(pref):]
+    return '', m
 
 
 def _strip_realm_prefix(name: str) -> str:
