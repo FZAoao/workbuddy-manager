@@ -225,6 +225,8 @@ async def upload_accounts(
                     if account['proxy']:
                         saved['proxy'] = account['proxy']
                     tencent._atomic_write_json(path, saved)
+                    if not existed:
+                        db.record_account_added(account['uid'], auth_dir)
                     reload.request_reload_or_restart(account['uid'], upstream=_reload_target(group))
                     item = {'file': filename, 'uid': account['uid'], 'updated': existed}
                     uploaded.append(item)
@@ -482,6 +484,7 @@ async def list_accounts(upstream_id: int | None = Query(None),
     # 备注随列表一次带回（issue #67）：按 uid 取，没有备注的账号给空串而不是缺字段
     # —— 前端两处视图（手机卡片 / 桌面表格）都直接读它，缺字段会多一处判空。
     notes = db.account_notes()
+    added_times = db.account_added_times(base_dir) if base_dir else {}
     # 今日签到状态随列表一次带回（和备注同一个理由：两处视图都直接读它）。
     # 数据源是本端签到记录 —— 腾讯对「今天已签过」回 10001 且我们照记，
     # 所以「本端签过」与「今天已签到」在这里是同一件事。上游自动签到不产
@@ -491,6 +494,7 @@ async def list_accounts(upstream_id: int | None = Query(None),
     for a in accounts:
         uid = str(a.get('uid') or '')
         a['note'] = notes.get(uid, '')
+        a['added_at'] = added_times.get(uid)
         a['checkin_today'] = done_today.get(uid)
     synced = sum(1 for a in accounts if a.get('credits') is not None)
     return {
@@ -510,12 +514,28 @@ async def list_accounts(upstream_id: int | None = Query(None),
     }
 
 
-@router.get('/status')
+@router.get('/upstream/status')
 async def upstream_status(upstream_id: int | None = Query(None),
                           user: dict = Depends(security.current_user)) -> dict:
+    """上游运行状态。
+
+    路径从 `/api/status` 迁到这里：那个地址要让给客户端余额协议的公开元数据
+    端点（见 routers/balance），而它必须无鉴权可达。本接口要登录，改用与
+    `/upstream/logs` 同族的命名。
+    """
     group = _group(upstream_id)
     return await wb2api.get_status(base_url=group['base_url'],
                                    api_key=upstreamsvc.forward_api_key(group))
+
+
+def _bare_model_id(raw: object) -> str:
+    """模型 id 的跨源比对键：去掉 `cn:` / `global:` 前缀（只用于比对，不改返回值）。"""
+    name = str(raw or '')
+    low = name.lower()
+    for pref in ('cn:', 'global:'):
+        if low.startswith(pref):
+            return name[len(pref):]
+    return name
 
 
 def _strip_cn_prefix(m: dict) -> dict:
@@ -564,6 +584,25 @@ async def models(
     # 曾用过 modelcatalog._strip_realm_prefix()，它把两种前缀都去掉了——那会让
     # 界面上的国际版模型名变成「不可用」，实测发现后改为只去 cn:。
     items = [_strip_cn_prefix(m) for m in items]
+    # 按模型中心目录裁掉已下架模型（issue #407）：上游 /v1/models 的静态表里
+    # 还留着 lkeap / v3-0324 这类早就不能用的名字，界面和客户端都会当成可选。
+    # 两个版本都取到腾讯直连目录时才裁；任一版本取不到就原样返回，不清空列表。
+    catalog_realms = ['global' if str(realm).strip().lower() == 'global' else 'cn'] if realm else ['cn', 'global']
+    known: set[str] | None = set()
+    for r in catalog_realms:
+        try:
+            cat = await modelcatalog.catalog(r)
+        except Exception:  # noqa: BLE001
+            known = None
+            break
+        if cat.get('source') != 'tencent':
+            known = None
+            break
+        known |= {_bare_model_id(m.get('id'))
+                  for m in (cat.get('models') or [])
+                  if isinstance(m, dict) and m.get('id')}
+    if known:
+        items = [m for m in items if _bare_model_id(m.get('id')) in known]
     return {
         'models': items,
         'source': wb2api.models_source(source_items),
@@ -938,6 +977,9 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
             ),
         ) from exc
 
+    if not existed:
+        db.record_account_added(str(result['uid']), auth_dir)
+
     # 账号已确实落盘，这时才丢 state（成功路径的收尾）
     tencent.drop_state(state)
     _provisioned_states.pop(state, None)
@@ -1094,22 +1136,27 @@ async def account_credits(
     }
 
 
-def _local_uids() -> set[str]:
-    """本机**所有分组**当前存在的账号 uid（含被临时禁用的）。
+def _local_accounts() -> dict[str, dict]:
+    """本机**所有分组**当前存在的账号 uid 及其调度状态（不查上游）。
 
     快照按 uid 登记、不分分组，所以判断「这个 uid 还在不在」也要跨分组找。
-    被禁用的账号算存在：那只是把文件改名为 `.disabled`，随时可以再启用
-    （与 `wb2api.list_auth_accounts` 的口径一致）。
+    `active` 只依赖本地就能判的信号：账号文件存在、没有 `.disabled` 后缀、
+    令牌没有过期。上游的 `disabled`/`manual_disabled` 要问 /status，这个只读
+    接口刻意不发请求；跨分组同名 uid 只要有一组可用就算可用。
     """
-    found: set[str] = set()
+    found: dict[str, dict] = {}
     for group in upstreamsvc.list_upstreams():
         directory = _group_dir(group)
         if directory is None:
             continue
         for account in wb2api.list_auth_accounts(directory):
             uid = str(account.get('uid') or '').strip()
-            if uid:
-                found.add(uid)
+            if not uid:
+                continue
+            active = (not str(account.get('file') or '').endswith('.disabled')
+                      and not account.get('is_expired'))
+            prev = found.get(uid)
+            found[uid] = {'active': active or bool(prev and prev['active'])}
     return found
 
 
@@ -1139,23 +1186,40 @@ def account_admin_api_status(upstream_id: int | None = Query(None),
 
 
 @router.get('/accounts/credits-snapshot')
-def credits_snapshot(user: dict = Depends(security.current_user)) -> dict:
-    """已登记的积分快照（只读）。
+def credits_snapshot(include_inactive: bool = Query(False),
+                     user: dict = Depends(security.current_user)) -> dict:
+    """已登记的积分快照（只读，**不触发任何上游查询**）。
 
-    给外部工具/对账用：**不触发任何上游查询**，只回面板已经记录下来的余额与登记
-    时刻。读接口，只读令牌也能调；请把数字按「已登记」使用，不要当实时余额。
+    给外部工具/对账用：默认只返回**当前还在、且还能被调度**的账号的登记值，
+    这样按 uid / 按域汇总出来的余额就是实际可花的量（issue #404）。已删除账号
+    的登记在删号时清掉，读取时也不会再返回；停用（`.disabled`）、令牌过期的
+    账号默认排除，传 `include_inactive=true` 可以连它们一起看，每行带
+    `active=false`。
 
-    快照**跨全部分组**（它按 uid 登记，不分组的），每行因此带一个 `known`：
-    该 uid 现在是否还对应一个本机账号。账号删掉之后，快照里那份历史记录不会
-    跟着消失 —— 对账脚本可以据 `known=false` 把它排除，或反过来当作
-    「这个账号曾经存在」的凭据。
+    `known` 仍保留：返回的每一行都是 known=true（历史记录/已删号不再下发）。
+    数字是「已登记」而非实时余额，请配合 `registered_at` 展示。
     """
     payload = creditsvc.snapshot_entries()
-    known = _local_uids()
+    local = _local_accounts()
+    rows: list[dict] = []
     for row in payload['accounts']:
-        row['known'] = row['uid'] in known
-    payload['known_count'] = sum(1 for row in payload['accounts'] if row['known'])
-    return payload
+        info = local.get(row['uid'])
+        if info is None:
+            # 已删账号：登记值不该再参与汇总（删号路径已清理，这里兜住升级前的残留）。
+            continue
+        row['known'] = True
+        row['active'] = bool(info['active'])
+        if row['active'] or include_inactive:
+            rows.append(row)
+    rows.sort(key=lambda r: r['uid'])
+    return {
+        'snapshot_at': max((r['registered_at'] or 0 for r in rows), default=0),
+        'count': len(rows),
+        'known_count': len(rows),
+        'active_count': sum(1 for r in rows if r['active']),
+        'total_registered': len(payload['accounts']),
+        'accounts': rows,
+    }
 
 
 @router.post('/accounts/refresh-credits')
@@ -2322,6 +2386,102 @@ def save_daily_plan(body: dict,
     return plan
 
 
+def _task_scheduler_status() -> dict:
+    """上游调度器与面板每日计划的重叠状态（issue #375）。"""
+    plan = dailyplan.get_plan()
+    try:
+        cfg = wb2api.load_upstream_config()
+        available = cfg.get('available') is not False
+        sched = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+    except Exception:  # noqa: BLE001 —— 配置读不到就按「不可用」展示，不阻断面板
+        available, sched = False, {}
+    upstream = {
+        'available': bool(available),
+        'checkin': bool(sched.get('checkin_enabled', True)),
+        'activity': bool(sched.get('activity_enabled', True)),
+    }
+    panel = {t: bool(plan[t]['enabled']) for t in dailyplan.TASKS}
+    conflicts: list[str] = []
+    if panel['checkin'] and upstream['checkin']:
+        conflicts.append('checkin')
+    if panel['compensation'] and upstream['activity']:
+        conflicts.append('compensation')
+    return {'upstream': upstream, 'panel': panel, 'conflicts': conflicts}
+
+
+def _set_upstream_overlap(enabled: bool) -> bool:
+    """把上游 checkin/activity 设成指定状态；返回是否真的改了配置。
+
+    只在状态不一致时写文件 + 触发重载：点「只保留上游」时上游通常本来就开着，
+    没必要为一次无变化的保存重启容器（会打断正在跑的请求）。
+    """
+    cfg = wb2api.load_upstream_config()
+    if cfg.get('available') is False:
+        raise HTTPException(status_code=409, detail=str(cfg.get('error') or '上游配置不可用'))
+    sched = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+    keys = ('checkin_enabled', 'activity_enabled')
+    if all(bool(sched.get(k, True)) == enabled for k in keys):
+        return False
+    wb2api.save_upstream_config({'schedule': {k: enabled for k in keys}})
+    return True
+
+
+@router.get('/accounts/task-scheduler')
+def get_task_scheduler(user: dict = Depends(security.current_user)) -> dict:
+    """两套调度的重叠状态；账号页据此提示「谁在跑」（issue #375）。"""
+    return _task_scheduler_status()
+
+
+@router.put('/accounts/task-scheduler')
+async def keep_task_scheduler(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+    """只保留一套调度（issue #375）。
+
+    - `upstream`：关闭面板的签到 / 领取补偿；领奖与做任务仍留在面板（上游没有）。
+    - `panel`：开启面板的签到 / 领取补偿，并关闭上游的 checkin / activity，
+      避免两套同时跑。会写上游 config 并触发热重载；改完需等容器重启生效。
+    """
+    keep = str((body or {}).get('keep') or '').strip()
+    if keep not in ('upstream', 'panel'):
+        raise HTTPException(status_code=400, detail="keep 只能是 upstream 或 panel")
+    if keep == 'upstream':
+        # 对称：若之前选过「只保留面板」，上游的 checkin/activity 已被关掉；
+        # 现在切回上游必须把它们重新打开，否则会变成「两边都没跑」。
+        try:
+            changed = _set_upstream_overlap(True)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        plan = dailyplan.set_overlap_enabled(False)
+        reloaded = reload.request_restart() if changed else None
+        security.audit(user, 'keep_task_scheduler', 'upstream',
+                       '关闭面板签到/领取补偿，恢复上游 checkin/activity')
+        result = {'plan': plan, 'scheduler': _task_scheduler_status(),
+                  'reload_scheduled': None if not changed else bool(reloaded)}
+        if changed and not reloaded:
+            result['reload_hint'] = ('配置已写入，但当前环境无法自动重启上游容器；'
+                                     '请手动重启后生效')
+        return result
+
+    # panel：先确认上游配置可写，避免「面板开了、上游没关」的半套状态。
+    try:
+        changed = _set_upstream_overlap(False)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    plan = dailyplan.set_overlap_enabled(True)
+    reloaded = reload.request_restart() if changed else None
+    security.audit(user, 'keep_task_scheduler', 'panel',
+                   '关闭上游 checkin/activity，改由面板签到/领取补偿')
+    result = {'plan': plan, 'scheduler': _task_scheduler_status(),
+              'reload_scheduled': None if not changed else bool(reloaded)}
+    if changed and not reloaded:
+        result['reload_hint'] = ('配置已写入，但当前环境无法自动重启上游容器；'
+                                 '请手动重启后生效')
+    return result
+
+
 @router.post('/accounts/daily-plan/run')
 async def run_daily_task_now(body: dict = Body(...),
                              user: dict = Depends(security.require_admin)) -> dict:
@@ -2497,12 +2657,22 @@ async def account_set_note(
 async def account_delete(filename: str, upstream_id: int | None = Query(None),
                          user: dict = Depends(security.require_session_admin)) -> dict:
     group = _group(upstream_id)
+    base_dir = _require_dir(group)
+    # 删之前先取 uid：快照按 uid 登记，文件没了就查不到是哪条要清（issue #404）。
+    uid = ''
     try:
-        removed = wb2api.delete_auth_account(filename, _require_dir(group))
+        raw = _load(filename, base_dir)
+        uid = str((raw.get('account') or {}).get('uid') or '')
+    except HTTPException:
+        uid = ''
+    try:
+        removed = wb2api.delete_auth_account(filename, base_dir)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail='账号文件不存在')
+    if uid:
+        creditsvc.forget(uid)
     reload.request_restart(upstream=_reload_target(group))
     return {'success': True}
 
@@ -2577,6 +2747,7 @@ async def account_move(
         uid = str((moved.get('account') or {}).get('uid') or '')
     except Exception:  # noqa: BLE001 —— 读不出 uid 不影响移动，只是少了重载收尾
         uid = ''
+    db.move_account_added(uid, src_dir, dst_dir)
     reload.request_reload_or_restart(uid, upstream=_reload_target(dst))
     return {
         'ok': True,

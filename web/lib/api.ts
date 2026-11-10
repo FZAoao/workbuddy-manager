@@ -7,8 +7,12 @@ import type {
   AccountsResponse,
   RefreshPlan,
   DailyPlan,
+  TaskSchedulerStatus,
+  TaskSchedulerApply,
   DailyTask,
   CreditsFlow,
+  AccountUsageResponse,
+  AccountModelUsageResponse,
   ApiKey,
   ApiToken,
   AuditLogPage,
@@ -47,6 +51,7 @@ import type {
   LotteryPrizeStatus,
   Me,
   ModelCatalog,
+  PricingInfo,
   ModelListResponse,
   Page,
   PgSyncConfig,
@@ -386,6 +391,11 @@ export const accountApi = {
   dailyPlan: () => get<DailyPlan>('/api/accounts/daily-plan'),
   saveDailyPlan: (plan: DailyPlan) =>
     put<DailyPlan>('/api/accounts/daily-plan', plan),
+  /** 上游与面板两套调度的重叠状态（issue #375） */
+  taskScheduler: () => get<TaskSchedulerStatus>('/api/accounts/task-scheduler'),
+  /** 只保留一套调度；panel 会写上游 config 并触发重载 */
+  keepTaskScheduler: (keep: 'upstream' | 'panel') =>
+    put<TaskSchedulerApply>('/api/accounts/task-scheduler', {keep}),
   /** 立即执行一次某个每日任务（不等定时） */
   runDailyTask: (task: DailyTask) =>
     post<{ok: boolean; message: string; task: string; plan: DailyPlan}>(
@@ -482,7 +492,7 @@ export const accountApi = {
 export const upstreamApi = {
   /** 上游运行状态。upstreamId 非空时查**该分组**的实例（多账号池）。 */
   status: (upstreamId?: number | null) =>
-    get<UpstreamStatus>('/api/status',
+    get<UpstreamStatus>('/api/upstream/status',
                         upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 上游模型简表；realm 非空时只返回该版本的条目 */
   models: (realm?: Realm) => get<ModelListResponse>('/api/models', {realm}),
@@ -726,10 +736,17 @@ export const logApi = {
 };
 
 /* ── 用量统计 ───────────────────────────────────────── */
+/** 自定义日期范围（issue #257）：两端都含；与 days 同时传时后端优先用日期。 */
+export interface StatsRange {
+  start?: string;
+  end?: string;
+}
+
 export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
-  daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  daily: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsagePoint[]>('/api/stats/daily', {days, realm, ...range}),
   /**
    * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
    * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
@@ -738,12 +755,18 @@ export const statsApi = {
     get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
 
   /** 积分收支（收入 / 支出）按天聚合 + 今日 / 近 7 天合计 */
-  creditsFlow: (days = 30, realm?: Realm) =>
-    get<CreditsFlow>('/api/stats/credits', {days, realm}),
-  byModel: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
-  byKey: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
+  creditsFlow: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<CreditsFlow>('/api/stats/credits', {days, realm, ...range}),
+  byModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm, ...range}),
+  byKey: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm, ...range}),
+  /** 按「日期 × 账号」聚合（issue #402）；同一范围解析规则 */
+  byAccount: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountUsageResponse>('/api/stats/by-account', {days, realm, ...range}),
+  /** 按「账号 × 模型」聚合（issue #369） */
+  byAccountModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountModelUsageResponse>('/api/stats/by-account-model', {days, realm, ...range}),
   /**
    * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
    * 且是自上游进程启动以来的累计（没有时段概念）。
@@ -822,6 +845,11 @@ export const settingsApi = {
   /** 立即重启上游（一般无需手动调用，保存配置会自动重载） */
   reloadUpstream: () =>
     post<{ok: boolean; message: string}>('/api/settings/upstash/reload'),
+  /** 计费价目表（issue #380）：版本、生效档、覆盖情况、节假日缺口 */
+  pricing: () => get<PricingInfo>('/api/settings/pricing'),
+  /** 保存覆盖价目；传 null 恢复成随版本分发的那份 */
+  savePricing: (body: Record<string, unknown> | null) =>
+    put<PricingInfo>('/api/settings/pricing', body),
   modelMap: () => get<Record<string, string>>('/api/settings/model-map'),
   saveModelMap: (body: Record<string, string>) =>
     post<Record<string, string>>('/api/settings/model-map', body),

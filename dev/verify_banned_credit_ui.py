@@ -36,7 +36,7 @@ with sync_playwright() as pw:
         if path == '/api/me': data = dict(username='regression',role='admin')
         elif path == '/api/upstreams': data = dict(items=[dict(id=1,name='默认分组',auth_dir='/app/auths',is_default=True,enabled=True)])
         elif path == '/api/accounts': data = dict(total=4, accounts=accounts, manageable=True)
-        elif path == '/api/status': data = dict(connected=True,accounts=accounts,total=4,healthy=1,disabled=2,cooling=1)
+        elif path == '/api/upstream/status': data = dict(connected=True,accounts=accounts,total=4,healthy=1,disabled=2,cooling=1)
         elif path == '/api/accounts/refresh-credits': data = dict(total=4,succeeded=4,failed=[],credits={a['uid']:a['credits'] for a in accounts},meta={})
         elif path == '/api/accounts/admin-api-status': data = dict(enabled=True)
         elif path == '/api/stats/credits': data = dict(days=7,today={},week={},total={},daily=[])
@@ -47,8 +47,9 @@ with sync_playwright() as pw:
     page.goto(BASE+'/dashboard',wait_until='networkidle')
     card = page.get_by_text('可用积分',exact=True).locator('../..')
     card.wait_for()
-    assert '100' in card.inner_text(),card.inner_text()
-    assert '不可用积分: 96,096' in card.inner_text(),card.inner_text()
+    # 冷却账号的 10 分计入可用（#381）；封禁 96066 + 会话失效 20 仍不可用。
+    assert '110' in card.inner_text(),card.inner_text()
+    assert '不可用积分: 96,086' in card.inner_text(),card.inner_text()
     page.screenshot(path=str(ROOT/'dashboard-desktop.png'))
     page.set_viewport_size({'width':390,'height':844})
     assert card.bounding_box()['width'] < 390
@@ -71,5 +72,5 @@ with sync_playwright() as pw:
     assert '封禁账号' not in dialog.inner_text()
     page.screenshot(path=str(ROOT/'relogin-queue.png'))
     assert not errors,errors
-    print('PASS: available=100, unavailable=96096; desktop/mobile layout, ban badge, appeal hint, disabled enable button, session-only relogin queue; no browser errors')
+    print('PASS: available=110, unavailable=96086; desktop/mobile layout, ban badge, appeal hint, disabled enable button, session-only relogin queue; no browser errors')
     browser.close()

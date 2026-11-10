@@ -11,6 +11,8 @@ export interface RefreshRisk {
 }
 
 export interface Account {
+  /** 本面板记录的添加时间（Unix 秒）；旧账号/直接拷贝的文件可能未知。 */
+  added_at?: number | null;
   refresh_risk?: RefreshRisk | null;
   proxy?: string;
   /**
@@ -193,6 +195,27 @@ export interface DailyPlan {
   full: DailyTaskConfig;
 }
 
+/** 上游与面板两套调度的重叠状态（issue #375）。 */
+export interface TaskSchedulerStatus {
+  upstream: {
+    available: boolean;
+    /** 上游 config.json 的 schedule.checkin_enabled */
+    checkin: boolean;
+    /** 上游 schedule.activity_enabled（内部含领取补偿） */
+    activity: boolean;
+  };
+  panel: Record<DailyTask, boolean>;
+  /** 两套都开的重叠任务：checkin / compensation */
+  conflicts: string[];
+}
+
+export interface TaskSchedulerApply {
+  plan: DailyPlan;
+  scheduler: TaskSchedulerStatus;
+  reload_scheduled: boolean | null;
+  reload_hint?: string;
+}
+
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
 export interface PoolCounts {
   total: number;
@@ -282,6 +305,8 @@ export interface ProxyProbe {
   exit_ip?: string;
   exit_info?: string;
   error?: string;
+  /** 失败时的可行动提示（协议/端口/认证/规则），原始 error 仍保留 */
+  hint?: string;
 }
 
 export interface ProxySettings {
@@ -648,6 +673,12 @@ export interface RequestLog {
   status: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或该行在功能上线前写入，
+   * 界面显示「—」——不能显示 ¥0，那会被读成「这次调用免费」。
+   */
+  cost: number | null;
   latency_ms: number;
   /**
    * 首字延迟（毫秒）：从发起上游请求到收到第一个含正文的 delta。
@@ -689,6 +720,10 @@ export interface UsagePoint {
   completion_tokens: number;
   /** 当日实际扣费合计 */
   credit: number;
+  /** 按 DeepSeek 官方价估算的费用（元）；null = 这天没有可计价的调用 */
+  cost: number | null;
+  /** 这天里没计入费用的请求数 */
+  unpriced_requests: number;
   /**
    * 当日失败请求数（4xx + 5xx 合计）。
    *
@@ -699,6 +734,8 @@ export interface UsagePoint {
    * 可选：老版本后端不返回该字段，界面按 0 处理（不显示失败）。
    */
   failed?: number;
+  /** 当日成功请求数（2xx，issue #369 第 3 点）；同样来自 request_logs。 */
+  success?: number;
 }
 
 /**
@@ -719,6 +756,8 @@ export interface UsageHourPoint {
   credit: number;
   /** 该小时的失败请求数（来自请求日志，与 `UsagePoint.failed` 同一口径） */
   failed: number;
+  /** 该小时的成功请求数（2xx） */
+  success?: number;
 }
 
 /** 一天的积分收入 / 支出（`/api/stats/credits` 的 daily 项） */
@@ -767,6 +806,44 @@ export interface CreditsFlow {
   hourly?: CreditsFlowHourPoint[];
 }
 
+export interface AccountUsageRow {
+  day: string;
+  account: string;
+  nickname: string;
+  uid8: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageRow {
+  account: string;
+  nickname: string;
+  uid8: string;
+  model: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageResponse {
+  items: AccountModelUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
+export interface AccountUsageResponse {
+  items: AccountUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
 export interface UsageBreakdown {
   name: string;
   requests: number;
@@ -774,6 +851,14 @@ export interface UsageBreakdown {
   completion_tokens: number;
   /** 该维度实际扣费合计 */
   credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或全在该列上线前，
+   * 界面显示「—」。**不是 0**：0 会被读成「免费」。
+   */
+  cost: number | null;
+  /** 同一维度里没有计入费用的请求数（模型不在价目表 / 历史行） */
+  unpriced_requests: number;
   /**
    * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
    * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
@@ -790,6 +875,19 @@ export interface StatsSummary {
   today_credit: number;
   week_credit: number;
   total_credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 该区间内没有任何可计价的调用（与「0 元」不同，界面显示「—」）。
+   */
+  today_cost: number | null;
+  week_cost: number | null;
+  total_cost: number | null;
+  /** 同一区间内**没有**计入费用的请求数——有它才能说清金额只覆盖了一部分调用 */
+  today_unpriced: number;
+  week_unpriced: number;
+  total_unpriced: number;
+  /** 费用币种（目前只有 CNY） */
+  cost_currency: string;
   week_requests: number;
   week_tokens: number;
   total_requests: number;
@@ -1223,9 +1321,9 @@ export interface Versions {
  * 这一列空的时候有四种完全不同的原因，后端把事实与判断依据一起返回。
  */
 export interface AccountBackfillInfo {
-  /** native = 读日志文件；docker = docker logs */
-  mode: 'native' | 'docker';
-  /** native 是文件路径，docker 是容器名 */
+  /** native = 日志文件；docker = docker logs；systemd = journal */
+  mode: 'native' | 'docker' | 'systemd';
+  /** native 是文件路径，docker 是容器名，systemd 是 unit 名 */
   source: string;
   /** 最近一次采集的时刻（epoch 秒，0 = 还没跑过） */
   checked_at: number;
@@ -1902,4 +2000,47 @@ export interface WatchdogQqTest extends WatchdogQqBotsResult {
   message?: string;
   sent_at?: number;
   umo?: string;
+}
+
+/* ── 计费价目（issue #380）──────────────────────────────── */
+export interface PricingModelRate {
+  cache_hit?: {peak?: number; off_peak?: number};
+  cache_miss?: {peak?: number; off_peak?: number};
+  output?: {peak?: number; off_peak?: number};
+}
+
+export interface PricingVersion {
+  effective_from: string;
+  verified_at: string;
+  source: string;
+  source_note?: string;
+  holiday_source?: string;
+  models: Record<string, PricingModelRate & {label?: string}>;
+  peak_windows: number[][];
+  peak_days: number[];
+  holiday_years: string[];
+  /** 是否是管理员自己覆盖的版本（不是随版本分发的那份） */
+  overridden: boolean;
+  /** 距上次核对官方价目的天数；null = 没写核验日期 */
+  age_days: number | null;
+}
+
+/**
+ * 价目表状态。
+ *
+ * `missing_holiday_years` 非空表示**节假日安排缺这一年**：那段时间的高峰判定
+ * 会退化成「只看周几」，节假日里本来该按空闲价算的调用会被按高峰价计（高估一倍）。
+ */
+export interface PricingInfo {
+  currency: string;
+  money_unit: string;
+  versions: PricingVersion[];
+  active: Record<string, unknown> | null;
+  is_peak_now: boolean;
+  override: Record<string, unknown> | null;
+  has_override: boolean;
+  missing_holiday_years: number[];
+  stale_after_days: number;
+  aliases: Record<string, string>;
+  priced_models: string[];
 }

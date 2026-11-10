@@ -17,8 +17,8 @@ from . import config, db, redpacket, security
 from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
-    accounts, accountrisk as accountrisk_router, anthropic, auth, gateway, keys, logs, models,
-    playground, pgsync as pgsync_router, proxies, redpackets, responses, restock,
+    accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs,
+    models, playground, pgsync as pgsync_router, proxies, redpackets, responses, restock,
     security as security_router, settings, stats, system, tokens, upstreams,
     watchdog as watchdog_router,
 )
@@ -149,7 +149,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.11.9',
+    version='2.11.13',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -338,6 +338,8 @@ app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
 app.include_router(gateway.router)
+# 余额协议（/api/usage/token/ 与 /api/status）：客户端面板据此显示剩余额度
+app.include_router(balance.router)
 # Anthropic Messages API 兼容层（/v1/messages）——给只认该协议的客户端用
 app.include_router(anthropic.router)
 # OpenAI Responses API 兼容层（/v1/responses、/responses）——给 Codex /
