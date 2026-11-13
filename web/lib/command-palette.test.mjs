@@ -41,7 +41,8 @@ const STUB = {
   'nav.prizes': '中奖记录', 'restock.tabLabel': '补货链接',
   'nav.dashboard': '总览', 'nav.accounts': '账号', 'nav.tasks': '任务', 'nav.keys': '密钥',
   'nav.redPackets': '红包', 'nav.models': '模型', 'nav.playground': '测试台',
-  'nav.stats': '统计', 'nav.logs': '日志', 'nav.security': '安全', 'nav.settings': '设置',
+  'nav.stats': '统计', 'nav.logs': '日志', 'nav.traces': '轨迹',
+  'nav.security': '安全', 'nav.settings': '设置',
   'nav.groupOverview': '总览', 'nav.groupOps': '运营', 'nav.groupGovernance': '治理',
   'settings.tabUpstream': '上游配置', 'settings.tabProxy': '代理',
   'settings.tabModels': '模型映射',
@@ -90,10 +91,12 @@ check(
 // 剩下的是「只在底栏里出现、任何零依赖模块里都没有」的页面。这里写死它们，
 // 是为了让「多出来的那一项」变成失败；它们与底栏是否一致由 Python 守卫比对
 // （那边能从 ManagementBar.tsx 里解析出真实的 dockItems）。
-const DOCK_ONLY = ['/dashboard', '/stats', '/logs', '/security', '/settings', '/prizes'];
+// 上游 2.11.14 加了「轨迹」（/traces），fork 有「中奖记录」（/prizes）—— 两个都要在。
+const DOCK_ONLY = ['/dashboard', '/stats', '/logs', '/traces', '/security', '/settings',
+                   '/prizes'];
 
 check(
-  '不在 section-nav / settings-tabs 里的项，正好是那 5 个底栏专属页',
+  '不在 section-nav / settings-tabs 里的项，正好是那 6 个底栏专属页',
   NAV_COMMANDS.map((c) => c.href)
     .filter((h) => !SECTIONS.some((s) => SECTION_NAV[s].some((i) => i.href === h))
                 && !SETTINGS_TABS.some((tab) => settingsTabHref(tab) === h))

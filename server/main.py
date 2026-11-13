@@ -19,7 +19,7 @@ from .stdio_utf8 import force_utf8_stdio
 from .routers import (
     accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs,
     models, playground, pgsync as pgsync_router, proxies, redpackets, responses, restock,
-    security as security_router, settings, stats, system, tokens, upstreams,
+    security as security_router, settings, stats, system, tap as tap_router, tokens, upstreams,
     watchdog as watchdog_router,
 )
 from .services import (
@@ -149,7 +149,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.11.13',
+    version='2.11.14',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -322,6 +322,9 @@ app.include_router(redpackets.claim_router)
 app.include_router(restock.public_router)
 app.include_router(restock.admin_router)
 app.include_router(logs.router)
+# 调用抓包（Trace Tap）：把每次调用的完整上下文留在面板里回放与对比，
+# 与请求日志是两套数据（见 services/tap.py 的模块注释）
+app.include_router(tap_router.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
 # 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
