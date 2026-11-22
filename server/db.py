@@ -118,6 +118,12 @@ CREATE TABLE IF NOT EXISTS api_keys (
   -- （如 0.05 表示一次调用的倍率扣费）。
   quota_credit  REAL    NOT NULL DEFAULT 0,
   used_credit   REAL    NOT NULL DEFAULT 0,
+  -- 每日 token 限额：0 = 不限。与总额度 quota 各自独立，任一超限即拒绝。
+  -- daily_used_tokens 只记 daily_used_day 那一天（本地日期，与 usage_daily 同口径）；
+  -- 日期一变即视为 0，不需要定时任务去清零。
+  daily_quota       INTEGER NOT NULL DEFAULT 0,
+  daily_used_tokens INTEGER NOT NULL DEFAULT 0,
+  daily_used_day    TEXT    NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL,
   last_used_at  INTEGER,
   -- 密钥明文（供管理员在密钥页再次查看 / 复制）。
@@ -137,6 +143,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_plain     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_keys_prefix ON api_keys(prefix);
+-- 注意：`key_hash` 的**唯一索引不在这里建**，而在 `_migrate()` 里（先清存量重复
+-- 再建）。写进 SCHEMA 会让「升级前就有重复 hash 的库」在建索引这一步抛错、
+-- 进而起不来 —— 而那种重复恰恰是最需要启动起来处理的情形。
 
 CREATE TABLE IF NOT EXISTS api_key_ips (
   key_id     INTEGER NOT NULL,
@@ -633,6 +642,10 @@ def _explain_db_open_failure(exc: Exception) -> str:
 
     上游自己的 compose 对 `./data` 写了 chown 提示，我们的漏了 —— 于是同样的坑
     在管理端这边表现为一条 sqlite 报错，用户完全猜不到是权限。
+
+    光给 chown 还不够：NAS / 群晖这类环境的目录属主根本改不了（或没开 SSH），
+    所以说明里同时给出「切到命名卷」这条不需要动宿主权限的路（见 compose 的
+    `WB_DATA_VOLUME` 开关）。
     """
     import os as _os
 
@@ -657,12 +670,18 @@ def _explain_db_open_failure(exc: Exception) -> str:
     lines.append(
         '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
         '  （compose 里的 `./data:/app/data`）属主由宿主机决定 —— docker 首次自动\n'
-        '  创建该目录时归 root，容器内的 10001 写不进去。宿主机执行一次即可：\n'
-        '    chown -R 10001:10001 ./data\n'
-        '  （在 docker-compose.yml 所在目录执行；10001 是镜像内 app 用户的 uid）\n'
-        '  若目录是网络文件系统（NFS/SMB）且不支持属主修改，改用命名卷：\n'
-        '    volumes:\n      - wb-manager-data:/app/data\n'
-        '  volumes:\n    wb-manager-data:'
+        '  创建该目录时归 root，容器内的 10001 写不进去。两种修法任选其一：\n'
+        '  ① 能改属主：在 docker-compose.yml 所在目录执行\n'
+        '       sudo chown -R 10001:10001 ./data\n'
+        '       docker restart workbuddy-manager\n'
+        '     （10001 是镜像内 app 用户的 uid；只重启、别重建，\n'
+        '       否则面板更新过的代码会退回镜像里的版本）\n'
+        '  ② 改不了属主（NAS 的 SMB/NFS、群晖 Container Manager、没开 SSH）：\n'
+        '     在 compose 同目录的 .env 里加一行\n'
+        '       WB_DATA_VOLUME=wb-manager-data\n'
+        '     再执行 docker compose up -d —— 命名卷首次创建会继承镜像内目录的\n'
+        '     属主，不需要 chown。旧版 compose 没有这个变量时，把挂载整行改成\n'
+        '     `- wb-manager-data:/app/data`，并在文件末尾加顶层 `volumes:` 声明。'
     )
     return '\n'.join(lines)
 
@@ -856,6 +875,11 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('request_logs', 'cache_write_tokens', 'INTEGER'),
     ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
     ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
+    # 每日 token 限额。存量密钥为 0 = **不限**，行为不变。
+    # 已用量按本地日期记在 daily_used_day 名下，跨天自动归零（读时判断，写时重置）。
+    ('api_keys', 'daily_quota', 'INTEGER NOT NULL DEFAULT 0'),
+    ('api_keys', 'daily_used_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('api_keys', 'daily_used_day', "TEXT NOT NULL DEFAULT ''"),
     # 密钥明文（供「密钥页再次查看 / 复制」，见 SCHEMA 里这一列的说明）。
     # 存量密钥为空串 = 取不回明文：那一版只存哈希，界面上要说清「去重建一把」，
     # 而不是显示一个空密钥让人以为复制坏了。
@@ -936,6 +960,48 @@ def _migrate(conn: sqlite3.Connection) -> None:
             # 并发启动时可能已被另一进程加过，忽略即可
             pass
     _rebuild_usage_daily_pk(conn)
+    _ensure_keys_hash_unique(conn)
+
+
+def _ensure_keys_hash_unique(conn: sqlite3.Connection) -> None:
+    """给 `api_keys.key_hash` 建唯一索引（issue #447）。
+
+    为什么需要：放开自定义密钥形态后，"检查是否已存在"（路由层）与 "INSERT"
+    之间有竞态窗口。实测 8 个线程并发用同一个 token 创建，会落下 **8 行同 hash**
+    的密钥 —— 之后鉴权随机命中任意一行，额度与日志归属全部错乱。应用层的 409
+    只负责友好提示，真正防重的必须是数据库约束。
+
+    为什么放在迁移里而不是 SCHEMA：默认的 `wbk_` 随机串撞车可忽略，但**手工
+    改过库**或旧版本遗留的数据可能有重复。若把唯一索引写进 SCHEMA，
+    `executescript` 会在启动时直接抛错、服务起不来 —— 而那种库恰恰最需要能
+    启动起来处理。
+
+    处理策略：先删重复**只保留 id 最小的一行**（最早创建的那把），再建索引。
+    删掉的重复行在功能上本来就等价于「同一个 token 的多份副本」，保留最早一份
+    不会让任何调用方失效。
+    """
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_keys_hash'"
+        ).fetchone()
+        if exists:
+            return
+        dup = conn.execute(
+            'SELECT key_hash FROM api_keys GROUP BY key_hash HAVING COUNT(*) > 1 LIMIT 1'
+        ).fetchone()
+        if dup:
+            conn.execute(
+                'DELETE FROM api_keys WHERE key_hash = ? AND id NOT IN '
+                '(SELECT MIN(id) FROM api_keys WHERE key_hash = ?)',
+                (dup[0], dup[0]))
+            conn.commit()
+            logger.warning('清理了重复的密钥哈希（保留最早一行）：%s…', str(dup[0])[:12])
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash)')
+        conn.commit()
+    except sqlite3.Error as exc:
+        # 建不上也不该让服务起不来：应用层的检查仍然在，只是没有数据库兜底。
+        logger.warning('未能建立 api_keys.key_hash 唯一索引（%s）；并发创建同名密钥'
+                       '可能产生重复，请检查表中是否有重复 key_hash', exc)
 
 
 def _rebuild_usage_daily_pk(conn: sqlite3.Connection) -> bool:
@@ -1055,7 +1121,18 @@ def query_one(sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
 def execute(sql: str, args: Iterable[Any] = ()) -> int:
     with _lock:
         conn = connect()
-        cur = conn.execute(sql, tuple(args))
+        try:
+            cur = conn.execute(sql, tuple(args))
+        except Exception:
+            # 失败必须回滚：sqlite3 在 execute 抛错时**不会**自动结束隐式事务，
+            # 连接上会留着写锁 —— 之后所有写操作都变成 "database is locked"
+            # （实测：一个 UNIQUE 冲突就能让整个进程的后续写入卡死）。
+            # 这条是既有缺陷，唯一索引只是让它变得容易复现。
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         conn.commit()
         return int(cur.lastrowid or 0)
 
@@ -1063,7 +1140,15 @@ def execute(sql: str, args: Iterable[Any] = ()) -> int:
 def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
     with _lock:
         conn = connect()
-        conn.executemany(sql, [tuple(x) for x in seq])
+        try:
+            conn.executemany(sql, [tuple(x) for x in seq])
+        except Exception:
+            # 同 execute：失败不回滚会让写锁挂在连接上
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         conn.commit()
 
 

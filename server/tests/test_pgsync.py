@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -255,6 +257,59 @@ class SourceIntrospectionTest(_Case):
         for secret in ('github_token', 'update_proxy', 'http_proxy',
                        'credits_snapshot'):
             self.assertNotIn(secret, [row[0] for row in rows])
+
+
+class BatchByteBudgetTest(_Case):
+    """按字节预算装批：行数不是内存的上界（issue #457）。
+
+    真实事故：`tap_turns` 744 行 / 553 MB，`BATCH = 1000` 让 `fetchmany(1000)`
+    一次把整张表读进内存（anon 494 MB），`mem_limit: 512m` 的容器被内核 OOM
+    kill，网关随后 504。这里的用例用「少量大行」在几 MB 的量级复现同一个形态。
+    """
+
+    def _make(self, name: str, rows: int, size: int) -> Path:
+        path = Path(self._tmp.name) / name
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute('CREATE TABLE wide (id INTEGER PRIMARY KEY, payload TEXT)')
+            blob = 'x' * size
+            conn.executemany('INSERT INTO wide(id, payload) VALUES(?, ?)',
+                             [(i, blob) for i in range(1, rows + 1)])
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_byte_budget_splits_wide_rows(self) -> None:
+        """大行不能攒成一批：一批的字节数必须落在预算附近。"""
+        path = self._make('wide.db', 40, 200 * 1024)      # 40 行 × 200KB ≈ 8MB
+        orig = pgsync.BATCH_BYTES
+        pgsync.BATCH_BYTES = 300 * 1024
+        try:
+            src = pgsync._SqliteSource(path)
+            try:
+                # 行数上限给 1000（远大于总行数）：只有字节预算能拦住它
+                chunks = list(src.rows('wide', ['id', 'payload'], 1000))
+            finally:
+                src.close()
+        finally:
+            pgsync.BATCH_BYTES = orig
+
+        self.assertEqual(sum(len(c) for c in chunks), 40)     # 一行都不能少
+        for chunk in chunks:
+            # 200KB/行 + 300KB 预算 → 一批最多两行；旧实现会是「一批 40 行」
+            self.assertLessEqual(len(chunk), 2)
+            self.assertLessEqual(sum(len(r[1]) for r in chunk), 400 * 1024)
+
+    def test_row_count_still_batches_small_rows(self) -> None:
+        """小行不受字节预算影响，仍按行数切 —— 别把常规表拖成一行一批。"""
+        path = self._make('small.db', 7, 8)
+        src = pgsync._SqliteSource(path)
+        try:
+            chunks = list(src.rows('wide', ['id', 'payload'], 3))
+        finally:
+            src.close()
+        self.assertEqual([len(c) for c in chunks], [3, 3, 1])
 
 
 class CopyTest(_Case):
@@ -623,3 +678,138 @@ class RealPgTest(_Case):  # pragma: no cover - 只在有 PG 的环境跑
 
 if __name__ == '__main__':
     unittest.main()
+
+class AutoExportBackoffTest(unittest.TestCase):
+    """自动导出失败后的退避（issue #457 的第二个遗留）。
+
+    事故形态：`tap_turns` 一次导出吃 500MB 被内核 OOM kill。进程直接消失，
+    连 `except` 都跑不到；而「上次导出时间」只在**成功**时写，于是 60 秒巡检
+    立刻再试 → 「OOM → 容器重启 → 仍逾期 → 再导出 → 再 OOM」的自持循环，
+    用户只能关掉功能才能让容器稳定。
+
+    修法：另记「上次尝试时刻」与「连续失败次数」，调度器按次数指数退避。
+    """
+
+    def setUp(self) -> None:
+        db.connect()
+        db.set_setting(pgsync.LAST_ATTEMPT_KEY, 0)
+        db.set_setting(pgsync.FAIL_COUNT_KEY, 0)
+
+    def tearDown(self) -> None:
+        db.set_setting(pgsync.LAST_ATTEMPT_KEY, 0)
+        db.set_setting(pgsync.FAIL_COUNT_KEY, 0)
+
+    def test_backoff_grows_then_caps(self) -> None:
+        expect = {0: 1, 1: 1, 2: 2, 3: 4, 4: 8, 5: 8, 20: 8}
+        for fails, want in expect.items():
+            db.set_setting(pgsync.FAIL_COUNT_KEY, fails)
+            self.assertEqual(pgsync._backoff_factor(), want, f'fails={fails}')
+
+    def test_success_resets_counter(self) -> None:
+        db.set_setting(pgsync.FAIL_COUNT_KEY, 5)
+        pgsync._note_attempt('export', ok=True)
+        self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 0)
+        self.assertEqual(pgsync._backoff_factor(), 1)
+
+    def test_failure_increments_counter(self) -> None:
+        pgsync._note_attempt('export', ok=False)
+        self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 1)
+
+    def test_attempt_stamp_written_at_start_not_at_finish(self) -> None:
+        """核心保证：尝试时刻必须在**启动任务时**写，不能等收尾。
+
+        只写在 `_run_job` 的 `finally` 里是不够的 —— 被内核 OOM kill / SIGKILL
+        时进程直接消失，`except` 与 `finally` 都不会跑，于是失败永远记不下，
+        重启后立刻重试、再被 kill。这是 issue #457 自持循环的真正修法。
+        """
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'services' / 'pgsync.py').read_text(encoding='utf-8')
+        start_job_body = src[src.index('def start_job'): src.index('def _run_job')]
+        self.assertIn('LAST_ATTEMPT_KEY', start_job_body,
+                      'start_job 必须在启动线程之前写尝试时刻（硬杀也不丢）')
+        self.assertLess(start_job_body.index('LAST_ATTEMPT_KEY'),
+                        start_job_body.index('thread.start()'),
+                        '写尝试时刻必须在线程启动之前')
+
+    def test_hard_kill_still_stamps_attempt(self) -> None:
+        """端到端：子进程调 start_job 后被 SIGKILL，尝试时刻仍在库里。"""
+        import subprocess
+        import sys as _sys
+        import tempfile as _tmp
+        workdir = _tmp.mkdtemp()
+        env = dict(os.environ)
+        env['WB_DATA_DIR'] = workdir
+        env['PYTHONPATH'] = os.environ.get('PYTHONPATH', '')
+        code = '\n'.join([
+            'from server import db',
+            'db.connect()',
+            'from server.services import pgsync',
+            "db.set_setting('pg_sync_config', {'host':'127.0.0.1','port':1,"
+            "'dbname':'x','user':'u','password':'p','enabled':False,"
+            "'interval_minutes':0})",
+            "print(pgsync.start_job('export'), flush=True)",
+            'import time; time.sleep(30)',
+        ])
+        proc = subprocess.Popen([_sys.executable, '-S', '-c', code], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True)
+        try:
+            first = proc.stdout.readline()
+            self.assertIn('True', first, f'子进程没能启动任务：{first!r}')
+        finally:
+            proc.kill()          # 等价 SIGKILL：finally 不执行
+            proc.wait()
+        conn = sqlite3.connect(str(pathlib.Path(workdir) / 'manager.db'))
+        try:
+            row = conn.execute('SELECT value FROM settings WHERE key = ?',
+                               (pgsync.LAST_ATTEMPT_KEY,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, '硬杀后尝试时刻必须已落库')
+        self.assertGreater(int(json.loads(row[0])), 0)
+
+    def test_import_does_not_touch_export_state(self) -> None:
+        """恢复任务不该影响导出的退避状态。"""
+        pgsync._note_attempt('import', ok=False)
+        self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 0)
+
+class PgConnectParamsTest(unittest.TestCase):
+    """PG 连接的参数必须是 libpq 认识的键（发版前审计发现的阻断级 bug）。
+
+    事故：为了给「对端永不应答」加读超时，写成了 `socket_timeout=300` —— 那是
+    **psycopg2** 的参数。psycopg3 会把未知 kwargs 展成 conninfo 交给
+    `PQconninfoParse` 校验，非法键抛 `ProgrammingError: invalid connection
+    option`，而这发生在**建连之前**，于是每一次导出/恢复都必然失败。
+
+    更隐蔽的是：`test_connection()`（界面上的「测试连接」）只传
+    `connect_timeout`，所以测试显示成功、备份却全失败。
+
+    这个守卫不联网，只静态检查：
+      1. 源码里不出现 `socket_timeout`（它是 psycopg2 的）；
+      2. 两处 `psycopg.connect` 用的是通过实测确认的 libpq 参数。
+    """
+
+    SRC = pathlib.Path(__file__).resolve().parents[1] / 'services' / 'pgsync.py'
+
+    def test_no_psycopg2_only_option(self) -> None:
+        src = self.SRC.read_text(encoding='utf-8')
+        # 注释里会提到它（解释为什么不能用），所以只看**调用参数**那一行
+        call_lines = [ln for ln in src.splitlines()
+                      if 'psycopg.connect(' in ln or 'socket_timeout=' in ln]
+        offenders = [ln.strip() for ln in call_lines
+                     if 'socket_timeout=' in ln and not ln.strip().startswith('#')]
+        self.assertEqual(offenders, [],
+                         'socket_timeout 是 psycopg2 的参数；psycopg3 会抛 '
+                         'ProgrammingError，导致每次备份都失败')
+
+    def test_uses_libpq_keepalive_params(self) -> None:
+        src = self.SRC.read_text(encoding='utf-8')
+        for name in ('tcp_user_timeout', 'keepalives_idle',
+                     'keepalives_interval', 'keepalives_count'):
+            self.assertIn(name, src, f'缺少 {name}：死连接不会被及时回收')
+
+    def test_both_connect_sites_use_same_params(self) -> None:
+        """导出与恢复必须用同一套参数 —— 否则会出现「一边能连一边不能」。"""
+        src = self.SRC.read_text(encoding='utf-8')
+        self.assertEqual(src.count('tcp_user_timeout=TCP_USER_TIMEOUT_MS'), 2,
+                         '导出与恢复两处 psycopg.connect 都应带上同样的超时参数')

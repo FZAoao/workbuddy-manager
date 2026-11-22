@@ -17,20 +17,23 @@ services:
   workbuddy-manager:
     build:
       context: .
-      # 可选：Debian 软件源镜像。
+      # 可选：Alpine 软件源镜像（镜像基于 python:3.12-alpine）。
+      # 官方源（dl-cdn.alpinelinux.org）国内偶有卡顿，填 mirrors.aliyun.com 可绕开。
+      #   docker compose build --build-arg ALPINE_MIRROR=mirrors.aliyun.com
       #
-      # 官方源（deb.debian.org）走 Fastly CDN，中国大陆访问实测**频繁 502 且极慢**
-      # （约 367 kB/s，常在下载某个 .deb 时中断），构建会在第 2 步 "apt-get update"
-      # 直接失败——表现就是镜像建不出来、容器起不来、页面 ERR_CONNECTION_REFUSED。
-      #
-      # Dockerfile 里已内置一次自动降级（官方源失败自动改阿里云重试），所以多数情况
-      # 不配也能建成功，只是会先白等一轮。想完全避免等待就把下面两行取消注释，
-      # 或临时用命令行覆盖：
-      #   docker compose build --build-arg DEBIAN_MIRROR=mirrors.aliyun.com
-      #
+      # DEBIAN_MIRROR 是旧版本的参数名，保留仅为兼容已有 compose（同样填 mirrors.aliyun.com
+      # 即可）；新部署请用 ALPINE_MIRROR。两者都留空 = 官方源。
       # 可选镜像：mirrors.aliyun.com / mirrors.tuna.tsinghua.edu.cn / mirrors.ustc.edu.cn
       args:
+        ALPINE_MIRROR: ""
         DEBIAN_MIRROR: ""
+        # 容器时区。**必须与下面 environment 里的 TZ 一致**：
+        #   · 构建期（这里）决定镜像里装不装 tzdata、/etc/localtime 指向哪；
+        #   · 运行期（environment）只是把 TZ 传进进程环境。
+        # 只设运行期而没装 tzdata 的话，Alpine 会让 localtime 静默退回 UTC ——
+        # 按日统计与每日限额会按 UTC 分天，且不报错。
+        #   docker compose build --build-arg TZ=Asia/Shanghai
+        TZ: "Asia/Shanghai"
         # 可选：PyPI 镜像（成因同上——官方源走国际 CDN，国内会抖动/失败）。
         # 留空 = 官方源，失败时 Dockerfile 会自动降级到清华镜像重试。
         # 可选镜像：https://pypi.tuna.tsinghua.edu.cn/simple / https://mirrors.aliyun.com/pypi/simple
@@ -54,15 +57,17 @@ services:
         # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
         #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
         BASE_PATH: ""
-    image: workbuddy-manager:latest
+    # 镜像名。默认与下面 build 的产物同名；要直接用预构建镜像，
+    # 在 .env 设 WB_MANAGER_IMAGE=<完整引用> 后 `docker compose up -d --no-build`。
+    image: ${WB_MANAGER_IMAGE:-workbuddy-manager:latest}
     container_name: workbuddy-manager
     # 这个 restart 策略是容器版「一键更新」能生效的前提：
     # 更新完成后容器内的进程会退出，靠它用新代码重新拉起。
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
-      # 首启管理员密码；不设则随机生成并打印到日志（推荐首启后立即改）
-      # WB_ADMIN_PASSWORD: "改成你的强密码"
+      # 首启管理员密码；不设（或留空）则随机生成并打印到日志（推荐首启后立即改）
+      WB_ADMIN_PASSWORD: ${WB_ADMIN_PASSWORD:-}
       # 上游地址：若上游与本品在同一 compose 网络，用服务名；否则填宿主机地址
       #   - 同网络（推荐）：http://workbuddy2api:7863
       #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
@@ -85,6 +90,15 @@ services:
       WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
       # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
       WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
+      # 容器日志：默认不打印逐请求 access log（避免健康检查/轮询刷屏）；
+      # 启动失败时只打精简说明 + 项目栈帧。临时抓请求时设 WB_ACCESS_LOG=1。
+      WB_ACCESS_LOG: ${WB_ACCESS_LOG:-0}
+      WB_STARTUP_FAILURE_STACK: ${WB_STARTUP_FAILURE_STACK:-1}
+      # 容器内进程的 uid/gid（入口脚本据此对齐挂载目录属主）。留空 = 自动
+      # 取挂载目录的属主，通常不用填；想固定下来就填 `stat -c '%u' ./data`
+      # 与 `stat -c '%g' ./data` 的两个数字（群晖上常见 1026 / 100）。
+      PUID: ${PUID:-}
+      PGID: ${PGID:-}
     ports:
       # **只监听本机**：管理端必须藏在反向代理之后。
       # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
@@ -98,7 +112,9 @@ services:
       # chown 不起作用。docker 首次自动创建 ./data 时归 root，而容器以 uid 10001
       # 运行 —— 结果是启动时报 `sqlite3.OperationalError: unable to open database
       # file`（那个报错既不说路径也不说原因，很容易误以为是路径配错了）。
-      # 宿主机在 compose 所在目录执行一次即可：
+      # 正常情况下不用管：入口脚本会按 PUID/PGID（不填则取挂载目录属主）
+      # 自动对齐 —— 容器以 root 起、改完属主再 su-exec 降权到非 root 运行。
+      # 若入口被 WB_FIX_OWNERSHIP=0 关掉，宿主机在 compose 所在目录执行一次：
       #   chown -R 10001:10001 ./data
       # 若目录在网络文件系统（NFS/SMB）上、改不了属主，改用命名卷：
       #   volumes:
@@ -106,7 +122,15 @@ services:
       #   # 文件末尾另加：
       #   volumes:
       #     wb-manager-data:
-      - ./data:/app/data
+      #
+      # **更省事的做法（NAS / 群晖 / 没开 SSH）**：不用改这份文件，也不用 chown。
+      # 命名卷首次创建时会继承镜像内 /app/data 的属主（10001），容器直接可写。
+      # 在 compose 同目录的 .env 里加一行，再执行 `docker compose up -d`：
+      #   WB_DATA_VOLUME=wb-manager-data
+      # 不设该变量时，下面这行等价于原来的 `- ./data:/app/data`，老部署行为不变。
+      # 切过去之后数据库不再落在宿主 ./data 里，取文件用：
+      #   docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db
+      - ${WB_DATA_VOLUME:-./data}:/app/data
       # 上游**整个仓库目录**。一次挂载覆盖下面三件事（分开挂子路径会互相重叠，
       # 反而让权限语义变模糊）：
       #   · 读/写上游 config.json —— 管理端「设置」页保存的目标
@@ -157,3 +181,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+# 顶层卷声明：只在 .env 里设置 WB_DATA_VOLUME=wb-manager-data 时才会被引用。
+# 默认（未设变量）仍走 ./data，这个卷不会被写入数据，也不影响已有部署。
+volumes:
+  wb-manager-data:

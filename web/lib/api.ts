@@ -34,6 +34,7 @@ import type {
   AutoUpdateConfig,
   AutoUpdateInfo,
   GithubMirror,
+  GatewayCors,
   IpAccessLog,
   IpRule,
   ImportResponse,
@@ -68,6 +69,7 @@ import type {
   RequestLog,
   SecurityConfig,
   StatsSummary,
+  StatsRealtime,
   TapConfigResponse,
   TapDiff,
   TapSession,
@@ -261,6 +263,16 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  /**
+   * 本分组的自定义顺序（拖拽排序）。
+   *
+   * 顺序存在服务端而不是浏览器里：它是这份部署的**共享视图**，换设备 / 换浏览器
+   * 打开要看到同一份顺序。它只是展示顺序，不影响上游选号或任何一次调用的结果。
+   */
+  order: (upstreamId?: number | null) =>
+    get<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId)),
+  saveOrder: (order: string[], upstreamId?: number | null) =>
+    put<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId), {order}),
   exportZip: async (upstreamId?: number | null) => {
     const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
       responseType: 'blob',
@@ -368,7 +380,7 @@ export const accountApi = {
        upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 并发刷新所有账号的实时积分 */
   /** 查询全部账号积分；force=false 时 60 秒内命中服务端缓存 */
-  refreshCredits: (force = true, upstreamId?: number | null) =>
+  refreshCredits: (force = true, upstreamId?: number | null, file?: string) =>
     post<{
       total: number;
       succeeded: number;
@@ -376,7 +388,9 @@ export const accountApi = {
       meta: Record<string, CreditsMeta>;
       failed: string[];
     }>('/api/accounts/refresh-credits?force=' + (force ? 'true' : 'false')
-       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)),
+       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)
+       // 单账号刷新（issue #432）：给了文件名就只刷这一个号
+       + (file ? `&file=${encodeURIComponent(file)}` : '')),
   checkinAll: (upstreamId?: number | null) =>
     post<{
       /**
@@ -854,6 +868,14 @@ export const statsApi = {
     ),
   repairUsage: () =>
     post<{repaired: number; requests: number; tokens: number}>('/api/stats/repair-usage'),
+  /**
+   * 实时并发 / RPM / 近 3 分钟走势。
+   *
+   * 与上面那些「按天聚合」的不是一回事：`inflight`/`capacity` 是**此刻**的瞬时值
+   * （来自上游 /status），`rpm_*`/`peaks`/`series` 来自本库、只含已完成请求。所以
+   * 它们的刷新节奏也不同（界面每 1 秒拉一次），也不跟 `range` 自定义区间走。
+   */
+  realtime: (days = 1) => get<StatsRealtime>('/api/stats/realtime', {days}),
 };
 
 /* ── 安全 / IP ──────────────────────────────────────── */
@@ -1001,6 +1023,10 @@ export const systemApi = {
   githubMirror: () => get<GithubMirror>('/api/settings/github-mirror'),
   saveGithubMirror: (mirror: string) =>
     put<GithubMirror>('/api/settings/github-mirror', {mirror}),
+  /** 网关数据面 CORS（issue #445）：给浏览器里的前端页面直连 `/v1` 用 */
+  gatewayCors: () => get<GatewayCors>('/api/settings/gateway-cors'),
+  saveGatewayCors: (body: Partial<Pick<GatewayCors, 'enabled' | 'origins' | 'max_age'>>) =>
+    put<GatewayCors>('/api/settings/gateway-cors', body),
   /** 自动更新：定时检测，在时间窗内自动执行一键更新 */
   autoUpdate: () => get<AutoUpdateInfo>('/api/settings/auto-update'),
   saveAutoUpdate: (cfg: AutoUpdateConfig) =>

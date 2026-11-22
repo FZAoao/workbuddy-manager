@@ -488,6 +488,10 @@ export interface ApiKey {
    */
   quota_credit: number;
   used_credit: number;
+  /** 每日 token 限额：0 = 不限；与 quota 各自独立，任一超限即拒绝 */
+  daily_quota: number;
+  /** 今天（服务器本地日期）已用的 token，次日 0 点归零 */
+  daily_used_tokens: number;
   /**
    * 绑定的上游接入点（多上游 / 分组隔离）；null = 默认上游。
    *
@@ -868,6 +872,67 @@ export interface UsageBreakdown {
   throughput_samples?: number;
 }
 
+/**
+ * 实时指标（`GET /api/stats/realtime`）。
+ *
+ * 与 `StatsSummary` 那类累计值口径不同，界面上必须分组显示：
+ * `inflight` / `capacity` 是**此刻**的瞬时值（来自上游 `/status`），上游不可达时
+ * 整组缺失；`rpm_*` / `peaks` / `series` 来自本库 `request_logs`，只含已完成请求。
+ */
+export interface StatsRealtimeSeries {
+  /** 窗口长度（秒） */
+  window: number;
+  /** 每个桶多少秒 */
+  step: number;
+  /** 窗口起点（epoch 秒，已对齐到 step 的整数倍） */
+  start: number;
+  end: number;
+  /** 每个桶的请求数 */
+  rpm: number[];
+  /** 每个桶内的并发峰值 */
+  concurrency: number[];
+}
+
+export interface StatsRealtimePeaks {
+  concurrency: number;
+  rpm: number;
+  /** 参与计算的行数：0 表示这段时间没有任何已完成请求 */
+  samples: number;
+}
+
+export interface StatsRealtime {
+  /** 上游 `/status` 是否取到；false 时只有 rpm_* / peaks / series 有效 */
+  available: boolean;
+  /**
+   * 客户端在途：面板正在处理、还没把响应写完的条数（含流式全过程、含排队）。
+   * 与 `inflight`（上游槽位占用）是两个视角，界面上一个当主数字、一个当小字。
+   */
+  client_inflight?: number;
+  /** 取不到上游时的原因（直接展示，服务端文案） */
+  error?: string;
+  days: number;
+  updated_at: number;
+  /** 最近 60 秒的请求数（即「此刻的 RPM」） */
+  rpm_60: number;
+  rpm_5m: number;
+  rpm_3m: number;
+  peaks: StatsRealtimePeaks;
+  series: StatsRealtimeSeries;
+  /** 以下仅在 available 时存在 */
+  inflight?: number;
+  busy_accounts?: number;
+  accounts_total?: number;
+  /** 国内版（`cn`）账号的单账号在途上限（`pool.max_in_flight`） */
+  per_account_limit?: number;
+  /** 国际版账号的单账号在途上限（`pool.max_in_flight_global`，不是全池上限） */
+  per_account_limit_global?: number;
+  /** 全池同时在途上限 = 各账号按 realm 取上限后求和 */
+  /** 总在途上限；`null` = 不限（上游 `pool.max_in_flight` 为 0）。缺失 = 上游不可达。 */
+  capacity?: number | null;
+  full_accounts?: number;
+  healthy?: number;
+  sticky?: number;
+}
 export interface StatsSummary {
   today_requests: number;
   today_tokens: number;
@@ -942,7 +1007,7 @@ export interface IpAccessLog {
   ua: string | null;
   /**
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
-   * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
+   * key_disabled / key_expired / quota_exhausted / daily_quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
    * rate_limited / key_auth_flood 等。
    *
@@ -1379,6 +1444,26 @@ export interface GithubMirror {
   source: 'panel' | 'env' | '';
   /** 界面上的快捷选项 */
   presets: string[];
+}
+
+/**
+ * 网关数据面 CORS（issue #445）。
+ *
+ * 与 `WB_CORS_ORIGINS`（管理面 `/api/*`，Cookie 会话）是**两套**东西：
+ * 这里管 `/v1`、`/v2`，鉴权走 Bearer，所以允许 `*`。
+ */
+export interface GatewayCors {
+  enabled: boolean;
+  /** 来源白名单；`*` = 任意，`null` = file:// 页面的字面量来源 */
+  origins: string[];
+  /** 预检结果缓存秒数（0 = 不缓存） */
+  max_age: number;
+  /** 条数上限（超过时保存会被拒） */
+  max_origins: number;
+  /** 本配置作用的路径前缀 */
+  prefixes: string[];
+  /** 管理面来源（`WB_CORS_ORIGINS`，只读展示） */
+  admin_origins: string[];
 }
 
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */

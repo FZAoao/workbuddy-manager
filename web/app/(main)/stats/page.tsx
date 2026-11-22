@@ -30,12 +30,15 @@ import {
   chartSpecFor,
   dailySeries,
   hourlySeries,
+  hourlyTargetFor,
   todayKeyLocal,
+  yesterdayKeyLocal,
   type ChartPoint,
 } from '@/lib/usage-chart';
 import {fmtCompact, fmtNumber, fmtCredit, fmtMoney } from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
+import {RealtimeStatsStrip} from '@/components/common/layout/RealtimeStatsStrip';
 import Link from 'next/link';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
@@ -128,9 +131,20 @@ export default function StatsPage() {
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
   const isCustom = days === 'custom';
+  const isYesterday = days === 'yesterday';
+  const yesterday = yesterdayKeyLocal();
   const range: StatsRange | undefined =
-    isCustom && customStart && customEnd ? {start: customStart, end: customEnd} : undefined;
+    isCustom && customStart && customEnd
+      ? {start: customStart, end: customEnd}
+      : isYesterday
+        ? {start: yesterday, end: yesterday}
+        : undefined;
+  /** 趋势图按小时画时该查哪一天（`null` = 这个范围按天画） */
+  const hourlyTarget = hourlyTargetFor({
+    days, customStart, customEnd, todayKey: todayKeyLocal(),
+  });
   const spanDays = (() => {
+    if (isYesterday) return 1;
     if (!isCustom || !customStart || !customEnd) return Number(days) || 1;
     const a = Date.parse(customStart), b = Date.parse(customEnd);
     if (!Number.isFinite(a) || !Number.isFinite(b)) return 30;
@@ -156,10 +170,13 @@ export default function StatsPage() {
     {
       summary: () => statsApi.summary(realm),
       daily: () => statsApi.daily(d, realm, range),
-      // 「今日」的图按小时画（见 lib/usage-chart.ts 的说明）：只有这个范围需要
-      // 小时数据，其它范围直接给空数组，省一次请求。
-      hourly: () => (days === '1' ? statsApi.hourly(undefined, realm)
-                                  : Promise.resolve([] as UsageHourPoint[])),
+      // 单日（今日 / 昨日 / 自定义同一天）按小时画，多日按天画。判据收在
+      // `hourlyTargetFor()` 里：自定义选同一天曾经漏了这一步，图上 24 根柱子全 0。
+      hourly: () => {
+        const target = hourlyTargetFor({days, customStart, customEnd, todayKey: todayKeyLocal()});
+        return target ? statsApi.hourly(target.day, realm)
+                      : Promise.resolve([] as UsageHourPoint[]);
+      },
       byModel: () => statsApi.byModel(d, realm, range),
       byKey: () => statsApi.byKey(d, realm, range),
       byAccount: () => statsApi.byAccount(d, realm, range),
@@ -224,7 +241,7 @@ export default function StatsPage() {
    *  · 多日 → 按天并补齐到窗口长度（缺的那天不再是「凭空消失」而是画成 0）。
    */
   const chartData: ChartPoint[] = spec.granularity === 'hour'
-    ? hourlySeries(hourly, new Date().getHours())
+    ? hourlySeries(hourly, hourlyTarget?.isToday ? new Date().getHours() : undefined)
     : dailySeries(daily, d, todayKeyLocal());
 
   /** 今日失败总数（4xx + 5xx）。单独来自请求日志——用量汇总只含成功请求。 */
@@ -246,6 +263,7 @@ export default function StatsPage() {
             <SelectContent>
               {/* 「今日」排在第一位并作为默认：与上方卡片的「今日」口径对齐 */}
               <SelectItem value="1">{t('stats.today')}</SelectItem>
+              <SelectItem value="yesterday">{t('stats.yesterday')}</SelectItem>
               <SelectItem value="7">{t('stats.last7')}</SelectItem>
               <SelectItem value="30">{t('stats.last30')}</SelectItem>
               <SelectItem value="90">{t('stats.last90')}</SelectItem>
@@ -384,6 +402,10 @@ export default function StatsPage() {
         </div>
       )}
 
+      {/* 实时指标：口径与下面那排累计卡不同 —— 这两个数说的是「此刻」，由组件自己
+          每 1 秒心跳一次，不跟本页 60 秒的刷新节奏走（标签页不可见时跳过）。 */}
+      <RealtimeStatsStrip days={d} />
+
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4 md:gap-4">
         <StatCard
           label={t('stats.todayRequests')}
@@ -508,6 +530,9 @@ export default function StatsPage() {
                 <YAxis yAxisId="cnt" orientation="right" tickLine={false} axisLine={false}
                        fontSize={11} stroke="var(--muted-foreground)" allowDecimals={false}
                        width={40} />
+                {/* 积分（issue #427）：与 token 也不同量级，单独一根更靠外的右轴，
+                    不和次数挤在一根上。hidden 只保留轴线占位，避免三根轴互相覆盖。 */}
+                <YAxis yAxisId="cr" orientation="right" hide />
                 <Tooltip
                   cursor={{fill: 'var(--accent)'}}
                   contentStyle={{
@@ -524,6 +549,9 @@ export default function StatsPage() {
                     }
                     if (label === 'success') {
                       return [fmtNumber(Number(value)), t('stats.successRequests')];
+                    }
+                    if (label === 'credit') {
+                      return [fmtCredit(Number(value)), t('stats.creditSeries')];
                     }
                     return [fmtNumber(Number(value)), t('metric.requests')];
                   }}
@@ -570,6 +598,19 @@ export default function StatsPage() {
                   name="success"
                   stroke="var(--chart-2)"
                   strokeWidth={1.5}
+                  dot={false}
+                />
+                {/* 积分消耗（issue #427）：与签到收入图不同，这条是**实际扣费**按
+                    时段聚合，走独立的右轴。虚线是为了与成功/失败两条次数线区分开——
+                    三者都可能贴 0，样式不给区分就分不清谁是谁。 */}
+                <Line
+                  yAxisId="cr"
+                  type="monotone"
+                  dataKey="credit"
+                  name="credit"
+                  stroke="var(--chart-4)"
+                  strokeWidth={1.5}
+                  strokeDasharray="5 3"
                   dot={false}
                 />
                 {/* 失败数用一条线叠在同一张图上：它与 token 柱不同量级，做成柱子

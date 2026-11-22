@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Gift,
   Zap,
@@ -72,7 +72,6 @@ import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
-import {AccountRiskWarnings} from '@/components/common/accounts/AccountRiskWarnings';
 import {UploadAccountsButton} from '@/components/common/accounts/UploadAccountsButton';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
@@ -125,6 +124,23 @@ const PAGE_SIZE = 20;
  */
 const groupOf = (a: Account) => availabilityGroup(availabilityOf(a));
 
+/**
+ * 把 `dragged` 挪到 `target` 的前面或后面，返回新数组。
+ *
+ * 用 `filter` 先摘掉被拖的那个，再按目标位置插回去 —— 不能靠 `indexOf` 摘除：
+ * 被拖的账号可能还不在顺序里（刚加的号、从没排过序的分组），`indexOf` 返回 -1
+ * 而 `splice(-1, 1)` 会删掉最后一项，用户会看到"拖一下少了一个号"。
+ */
+function moveWithin(
+  order: readonly string[], dragged: string, target: string, after: boolean,
+): string[] {
+  const rest = order.filter((uid) => uid !== dragged);
+  const at = rest.indexOf(target);
+  if (at < 0) return [...order];
+  rest.splice(after ? at + 1 : at, 0, dragged);
+  return rest;
+}
+
 export default function AccountsPage() {
   const {realm, label: realmName} = useRealm();
   const t = useT();
@@ -157,6 +173,16 @@ export default function AccountsPage() {
   const [statusGroup, setStatusGroup] = useState<GroupFilter>('all');
   const [sort, setSort] = useState<SortKey>('default');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+  /**
+   * 自定义顺序（拖拽排序）：uid 数组，存在**服务端**（server/services/accountorder.py）。
+   *
+   * 为什么不做浏览器本地存储：顺序是这份部署的共享视图 —— 同一个面板可能有多人
+   * 使用、也可能换设备打开，本地存会让每个人看到不同的顺序。它只影响展示顺序，
+   * 不影响上游选号。
+   */
+  const [manualOrder, setManualOrder] = useState<string[]>([]);
+  /** 正在被拖动的账号 uid；null = 没在拖（行上据此出高亮） */
+  const [draggingUid, setDraggingUid] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   /**
    * 账号分组（多账号池）：一个分组 = 一套上游实例（账号池）。
@@ -318,6 +344,30 @@ export default function AccountsPage() {
     }
   }, [groupId]);
 
+  /** 只刷新单个账号的积分（issue #432）：账号多时不必把整池都打一遍上游 */
+  const refreshOneCredits = useCallback(async (file: string) => {
+    setCreditsBusy(true);
+    try {
+      const r = await accountApi.refreshCredits(true, groupId, file);
+      const num = Object.fromEntries(
+        Object.entries(r.credits).filter(([, v]) => typeof v === 'number') as [string, number][],
+      );
+      setLiveCredits((prev) => ({...prev, ...num}));
+      setCreditsMeta((prev) => ({...prev, ...(r.meta ?? {})}));
+      if (r.failed.length === 0) {
+        notify.ok(t('accounts.creditsRefreshed'), t('accounts.creditsRefreshedDetail',
+          {ok: r.succeeded, total: r.total}));
+      } else {
+        notify.warn(t('accounts.creditsPartial'), t('accounts.creditsPartialDetail',
+          {ok: r.succeeded, total: r.total}));
+      }
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setCreditsBusy(false);
+    }
+  }, [groupId, t]);
+
   /** 一键刷新所有账号的 accessToken（真的续期，末尾只重载一次上游） */
   const [refreshTokensBusy, setRefreshTokensBusy] = useState(false);
   const refreshAllTokens = useCallback(async () => {
@@ -453,8 +503,12 @@ export default function AccountsPage() {
       selectAccounts(visible, {q, group: statusGroup, sort, direction: sortDirection}, {
         groupOf,
         creditOf: (a) => liveCredits[a.uid] ?? a.credits ?? null,
+        orderRank: (a) => {
+          const i = manualOrder.indexOf(a.uid);
+          return i < 0 ? null : i;
+        },
       }),
-    [visible, q, statusGroup, sort, sortDirection, liveCredits],
+    [visible, q, statusGroup, sort, sortDirection, liveCredits, manualOrder],
   );
 
   const paged = useMemo(() => paginate(filtered, page, PAGE_SIZE), [filtered, page]);
@@ -466,6 +520,113 @@ export default function AccountsPage() {
    * 闪一下「没有数据」再恢复。同日志页切版本的处理方式。
    */
   if (paged.page !== page) setPage(paged.page);
+
+  /* ── 拖拽排序 ────────────────────────────────────────────────
+   * 长按「头像 / 昵称」320ms 进入拖动，移动时实时改顺序，松手落库。
+   * 用长按而不是直接拖，是因为这一格同时是文本：直接拖会让每次想选中昵称
+   * 都变成挪行。拖动阈值 8px，超过就当"用户在选字/滚动"直接取消。
+   */
+  const dragPressRef = useRef<{uid: string; x: number; y: number; timer: number | null} | null>(null);
+  const draggingRef = useRef<string | null>(null);
+  const manualOrderRef = useRef<string[]>([]);
+  const visibleRef = useRef<Account[]>([]);
+  const dragStartOrderRef = useRef<string[]>([]);
+
+  useEffect(() => { draggingRef.current = draggingUid; }, [draggingUid]);
+  useEffect(() => { manualOrderRef.current = manualOrder; }, [manualOrder]);
+  useEffect(() => { visibleRef.current = visible; }, [visible]);
+
+  useEffect(() => {
+    let alive = true;
+    accountApi.order(groupId)
+      .then((res) => { if (alive) setManualOrder(res.order ?? []); })
+      // 取不到顺序不该让整页报错：退化成空顺序 = 后端顺序，用户仍能正常操作。
+      .catch(() => { if (alive) setManualOrder([]); });
+    return () => { alive = false; };
+  }, [groupId]);
+
+  const persistOrder = useCallback(async (order: string[]) => {
+    try {
+      const res = await accountApi.saveOrder(order, groupId);
+      setManualOrder(res.order ?? order);
+      notify.ok(t('accounts.orderSaved'));
+    } catch (exc) {
+      notify.err(t('accounts.orderSaveFailed'), errText(exc));
+    }
+  }, [groupId, t]);
+
+  useEffect(() => {
+    function clearPress() {
+      const press = dragPressRef.current;
+      if (press?.timer) clearTimeout(press.timer);
+      dragPressRef.current = null;
+    }
+
+    function onMove(e: PointerEvent) {
+      const press = dragPressRef.current;
+      if (press) {
+        if (Math.abs(e.clientX - press.x) > 8 || Math.abs(e.clientY - press.y) > 8) clearPress();
+        return;
+      }
+      const dragged = draggingRef.current;
+      if (!dragged) return;
+      e.preventDefault();
+
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const target = el?.closest?.('tr[data-uid]') as HTMLElement | null;
+      const overUid = target?.dataset.uid;
+      if (!target || !overUid || overUid === dragged) return;
+
+      const rect = target.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height / 2;
+      setManualOrder((prev) => moveWithin(
+        // 第一次拖动时顺序还是空的：以当前可见顺序为底稿，否则没有可插入的位置
+        prev.length ? prev : visibleRef.current.map((a) => a.uid), dragged, overUid, after,
+      ));
+    }
+
+    function onUp() {
+      clearPress();
+      if (!draggingRef.current) return;
+      setDraggingUid(null);
+      void persistOrder(manualOrderRef.current);
+    }
+
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || !draggingRef.current) return;
+      setManualOrder(dragStartOrderRef.current);
+      setDraggingUid(null);
+      dragPressRef.current = null;
+    }
+
+    document.addEventListener('pointermove', onMove, true);
+    document.addEventListener('pointerup', onUp, true);
+    document.addEventListener('pointercancel', onUp, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointermove', onMove, true);
+      document.removeEventListener('pointerup', onUp, true);
+      document.removeEventListener('pointercancel', onUp, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [persistOrder]);
+
+  function handleDragPointerDown(e: React.PointerEvent, a: Account) {
+    // 顺序是**所有人**看到的，所以只有管理员能改（后端同样设了管理员门槛）
+    if (!isAdmin || e.button !== 0) return;
+    dragPressRef.current = {
+      uid: a.uid,
+      x: e.clientX,
+      y: e.clientY,
+      timer: window.setTimeout(() => {
+        dragPressRef.current = null;
+        dragStartOrderRef.current = manualOrderRef.current;
+        // 别的排序档位下松手会被立刻覆盖回去，所以拖动前先切到自定义顺序
+        setSort('manual');
+        setDraggingUid(a.uid);
+      }, 320),
+    };
+  }
 
   /** 三种「看不到账号」的原因，必须分开说——它们要用户做的事完全不同 */
   const noAccountsAtAll = merged.length === 0;
@@ -1099,6 +1260,13 @@ export default function AccountsPage() {
                                  t('accounts.refreshDone'))}>
               <KeyRound className="h-3.5 w-3.5" />
             </Button>
+            {/* 单号刷新积分（issue #432）：账号多时只想更新这一个号的余额，
+                不必为它把整池都打一遍上游。 */}
+            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md"
+              title={t('accounts.refreshOneCredits')} disabled={busy}
+              onClick={() => void refreshOneCredits(a.file)}>
+              <Coins className="h-3.5 w-3.5" />
+            </Button>
           </>
         )}
         {!paused && hasClearableState && (
@@ -1213,7 +1381,6 @@ export default function AccountsPage() {
 
   return (
     <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
-      <AccountRiskWarnings upstreamId={groupId} />
       <PageHeader
         stacked
         title={t('accounts.title')}
@@ -1514,12 +1681,13 @@ export default function AccountsPage() {
                 <SelectTrigger className="h-9 w-[150px] bg-background" aria-label={t('accounts.sortLabel')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="default">{t('accounts.sortDefault')}</SelectItem>
+                  <SelectItem value="manual">{t('accounts.sortManual')}</SelectItem>
                   <SelectItem value="remain">{t('accounts.sortRemain')}</SelectItem>
                   <SelectItem value="credits">{t('accounts.sortCredits')}</SelectItem>
                   <SelectItem value="added">{t('accounts.sortAdded')}</SelectItem>
                 </SelectContent>
               </Select>
-              {sort !== 'default' && (
+              {sort !== 'default' && sort !== 'manual' && (
                 <Button variant="outline" size="sm" className="h-9 gap-1.5"
                   aria-label={t('accounts.sortDirectionToggle', {direction: t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')})}
                   onClick={() => { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); setPage(1); }}>
@@ -1530,6 +1698,7 @@ export default function AccountsPage() {
             </div>
           </div>
           {sort === 'added' && <p className="mt-2 text-xs text-muted-foreground">{t('accounts.sortAddedHint')}</p>}
+          {sort === 'manual' && <p className="mt-2 text-xs text-muted-foreground">{t('accounts.sortManualHint')}</p>}
         </section>
       )}
 
@@ -1617,8 +1786,16 @@ export default function AccountsPage() {
           </TableHeader>
           <TableBody>
             {paged.rows.map((a) => (
-              <TableRow key={a.file} className="border-b border-border/40">
-                <TableCell className="pl-4">
+              <TableRow
+                key={a.file}
+                data-uid={a.uid}
+                className={'border-b border-border/40' + (draggingUid === a.uid
+                  ? ' bg-primary/10 outline-2 -outline-offset-2 outline-primary/50' : '')}
+              >
+                <TableCell
+                  className={'pl-4' + (isAdmin && sort === 'manual' ? ' cursor-grab' : '')}
+                  onPointerDown={(e) => handleDragPointerDown(e, a)}
+                >
                   <div className="flex items-center gap-2.5">
                     {renderAvatar(a)}
                     <div className="min-w-0">

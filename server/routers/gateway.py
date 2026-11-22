@@ -955,13 +955,25 @@ def key_usage(request: Request):
         _record(key, ip, '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
         return _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
-    def allowance(limit: int | None, used: int | None) -> dict:
-        used_n = int(used or 0)
-        limit_n = int(limit or 0)
+    def allowance(limit, used, *, integral: bool = True) -> dict:
+        """额度三元组。**积分是小数、token 是整数**，必须分开处理（issue #450）。
+
+        历史上这里对两者都用 `int()`：`quota_credit=0.5`、`used_credit=0.04`
+        被截成 `int(0.5)=0` / `int(0.04)=0`，于是 limit 变成 None（被当成「不限」）、
+        used 恒为 0 —— 面板上明明有额度与消耗，`/v1/usage` 却一路报空。
+        """
+        if integral:
+            used_n: int | float = int(used or 0)
+            limit_n: int | float = int(limit or 0)
+        else:
+            used_n = round(float(used or 0), 6)
+            limit_n = round(float(limit or 0), 6)
         return {
             'used': used_n,
             'limit': limit_n or None,          # None = 不限制
-            'remaining': max(0, limit_n - used_n) if limit_n else None,
+            'remaining': (max(0, limit_n - used_n) if limit_n else None)
+                         if integral else
+                         (round(max(0.0, limit_n - used_n), 6) if limit_n else None),
         }
 
     now = int(time.time())
@@ -983,7 +995,10 @@ def key_usage(request: Request):
             'models': list(key.get('models') or []),
         },
         'tokens': allowance(key.get('quota'), key.get('used_tokens')),
-        'credits': allowance(key.get('quota_credit'), key.get('used_credit')),
+        # 积分是**小数**（0.04 这类），按整数转型会被截成 0（issue #450）
+        'credits': allowance(key.get('quota_credit'), key.get('used_credit'), integral=False),
+        # 今日 token（本地日期，次日 0 点恢复）；limit 为 None = 不限
+        'daily_tokens': allowance(key.get('daily_quota'), key.get('daily_used_tokens')),
         'last_used_at': int(key.get('last_used_at') or 0),
         # 这几个数字是面板**已记录**的值，读取时刻即 snapshot_at；不是向上游现问的。
         'snapshot_at': now,
@@ -1546,3 +1561,143 @@ async def gateway_health() -> dict:
     except Exception:  # noqa: BLE001
         # 不回异常详情：那会暴露上游地址与网络拓扑
         return {'service': 'workbuddy-manager', 'upstream_ok': False}
+
+
+# ── agenttool web search 透传（/v1/tools/search）────────────────
+# 把下游的 web_search 请求原样转发到上游网关的 agenttool 搜索端点
+# （workbuddy2api 0057-web-search-tool.patch：账号池轮转 + 15001 配额冷却）。
+#
+# 为什么加这条路由：DSH 的 web-search-workbuddy 插件用**同一把密钥**既调模型
+# （/v1/chat/completions）又调搜索——密钥体系一把钥匙走全部数据面，搜索不该
+# 另立凭证。manager 在这里只做：鉴权（_authorize）→ 按密钥解析上游
+# （_upstream_for，多分组隔离语义与 chat 一致）→ 换上游 api_key 转发 → 记账。
+#
+# 协议是「透传」不是「翻译」：上游的信封（code/results/total_results/…）原样
+# 回给客户端，非 15001 的业务码也原样透传——过滤语义由调用方决定（与 chat 的
+# error-passthrough 同哲学）。请求体同理：只校验已知参数，不改写、不删字段，
+# 未知字段也原样放行（兼容后续 agenttool 参数扩展）。
+SEARCH_UPSTREAM_PATH = '/v1/tools/search'
+
+# agenttool/v1/search 支持的全部可选参数（0057 网关 toolSearchRequest 同款）。
+# freshness：d1=一天内 / m1=一月内 / y1=一年内；空串等同不传。
+SEARCH_FRESHNESS_VALUES = ('', 'd1', 'm1', 'y1')
+SEARCH_MAX_RESULTS_BOUND = 20
+
+
+def _validate_search_params(body: object) -> str | None:
+    """校验 /v1/tools/search 的入站参数，返回错误描述；None 表示合法。
+
+    只校验、不改写 body：校验通过后 body 原样转发给 0057 网关，由网关负责
+    max_results 兜底、blocked_domains 拼 `-site:` 进 query、以及 agenttool
+    上游请求体的组装。非法参数在 manager 层早失败，不消耗账号池搜索配额。
+    """
+    if not isinstance(body, dict):
+        return '请求体必须是 JSON 对象'
+    if not isinstance(body.get('query'), str):
+        return 'query 必须是字符串'
+    if 'type' in body and body['type'] != 'text2text':
+        return 'type 必须是 "text2text"'
+    if 'max_results' in body:
+        value = body['max_results']
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= SEARCH_MAX_RESULTS_BOUND:
+            return f'max_results 必须是 1..{SEARCH_MAX_RESULTS_BOUND} 的整数'
+    for key in ('allowed_domains', 'blocked_domains'):
+        if key in body:
+            value = body[key]
+            if not isinstance(value, list) or any(not isinstance(d, str) for d in value):
+                return f'{key} 必须是字符串数组'
+    if 'freshness' in body:
+        value = body['freshness']
+        if not isinstance(value, str) or value not in SEARCH_FRESHNESS_VALUES:
+            return 'freshness 必须是 d1 | m1 | y1'
+    return None
+
+
+@router.post('/v1/tools/search')
+async def tools_search(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    # 入站鉴权与 chat 同管线（wbk_ 密钥 / IP 规则 / 频控）。搜索没有模型维度，
+    # 因此走 is_model_list=True 口径（与 /v1/models 同理）：版本归属与模型白名单
+    # 在这种「不带 model 的数据面调用」上不拦——拦了会让限定版本的密钥连搜索都
+    # 用不了；真正的隔离由上游网关的账号池把关（realm 由上游按账号侧决定）。
+    key, ip, err = _authorize(request, None, is_model_list=True)
+    if err:
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是合法 JSON', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    if not isinstance(body, dict):
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是 JSON 对象', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    query = str(body.get('query') or '').strip()
+    if not isinstance(body.get('query'), str) or not query:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, 'query 为空或非字符串', False,
+                account_expected=False)
+        return _oai_error('query 不能为空且必须是字符串', 400, 'invalid_request_error', 'empty_query')
+
+    # agenttool 全参数入站校验（type / max_results / allowed_domains /
+    # blocked_domains / freshness）。合法 body 原样转发，不重命名、不删字段。
+    param_error = _validate_search_params(body)
+    if param_error:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, f'搜索参数非法: {param_error}', False,
+                account_expected=False)
+        return _oai_error(param_error, 400, 'invalid_request_error', 'invalid_search_params')
+
+    upstream, upstream_err = _upstream_for(key, ip=ip, model='', mapped='', ua=ua)
+    if upstream_err:
+        return upstream_err
+    url = f'{upstream["base_url"]}{SEARCH_UPSTREAM_PATH}'
+    up_headers = _upstream_headers(upstream)
+    # 出站转储关联键：与 chat 同协议（上游开启转储后按它落两行，双视角对回）。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
+
+    started = time.time()
+    try:
+        async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+            resp = await client.post(url, json=body, headers=up_headers)
+        latency = int((time.time() - started) * 1000)
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            data = None
+        # 记账：搜索没有 token 计量（上游 agenttool 不回 usage），0/0 与
+        # /v1/models、/v1/usage 的口径一致；错误时透传上游原文前 500 字。
+        error = None if resp.status_code < 400 else (
+            str(data)[:500] if data is not None else resp.text[:500])
+        # 客户端语义化：全池 15001 时上游网关回 429 + quota_web_search，
+        # 原样透传（客户端按 code 路由提示语）。
+        _record(key, ip, '', '', resp.status_code, 0, 0, latency, ua, error, False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=resp.status_code,
+            latency_ms=latency, stream=False, payload=data,
+            error=error, upstream_body=body, upstream_headers=up_headers,
+            trace_id=trace_id,
+        )
+        if data is not None:
+            return JSONResponse(data, status_code=resp.status_code)
+        return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}},
+                            status_code=resp.status_code)
+    except Exception as exc:  # noqa: BLE001
+        latency = int((time.time() - started) * 1000)
+        _record(key, ip, '', '', 502, 0, 0, latency, ua, str(exc), False,
+                account_expected=False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=502,
+            latency_ms=latency, stream=False, error=str(exc),
+            upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
+        )
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502,
+                          'api_error', 'upstream_unavailable')

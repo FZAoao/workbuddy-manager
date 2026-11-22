@@ -446,3 +446,50 @@ class AlwaysFailingBadgeTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PopoverInDialogScrollTest(unittest.TestCase):
+    """弹窗内浮层的滚轮不能被 Dialog 的滚动锁吞掉（issue #438）。
+
+    源码级守卫：Radix Dialog 的 RemoveScroll 只放行「被锁元素子树内」的滚轮，
+    Popover 默认 Portal 到 body 会被判为外部。修法是把 container 指到
+    dialog-content 上；这两处任何一处被改回去，滚轮都会重新失效（拖滚动条仍能用，
+    所以肉眼很难发现）。
+    """
+
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.popover = (root / 'web' / 'components' / 'ui' / 'popover.tsx').read_text(encoding='utf-8')
+        self.whitelist = (root / 'web' / 'components' / 'common' / 'keys'
+                          / 'ModelWhitelistInput.tsx').read_text(encoding='utf-8')
+
+    def test_popover_accepts_container(self) -> None:
+        self.assertIn('container', self.popover, 'PopoverContent 必须支持指定 Portal 落点')
+        self.assertIn('Portal container=', self.popover, 'container 要真的传给 Portal')
+
+    def test_whitelist_uses_dialog_content_as_container(self) -> None:
+        self.assertIn('data-slot="dialog-content"', self.whitelist,
+                      '浮层落点必须找 dialog-content 子树')
+        self.assertIn('container={portalContainer}', self.whitelist,
+                      'PopoverContent 必须接收算出来的落点')
+
+
+class PopoverInDialogCollisionTest(unittest.TestCase):
+    """弹窗内浮层不能越过弹窗边缘被裁掉（issue #454）。
+
+    源码级守卫：#438 把 Popover 的 Portal 落点改到 dialog-content 子树修好
+    滚轮后，Popper 的碰撞检测默认仍按视口算可用空间——密钥弹窗里模型字段
+    在表单末尾，浮层向下展开必然越过弹窗底边，被 DialogContent 的
+    overflow-hidden 裁掉大半（见 #454 截图）。修法是把 collisionBoundary
+    指到与 Portal 落点同一个 dialog-content 元素：落点与边界任何一处
+    对不上，这个 bug 都会回来。
+    """
+
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.whitelist = (root / 'web' / 'components' / 'common' / 'keys'
+                          / 'ModelWhitelistInput.tsx').read_text(encoding='utf-8')
+
+    def test_collision_boundary_matches_portal_container(self) -> None:
+        self.assertIn('collisionBoundary={portalContainer}', self.whitelist,
+                      '浮层的碰撞边界必须与 Portal 落点是同一个弹窗元素')

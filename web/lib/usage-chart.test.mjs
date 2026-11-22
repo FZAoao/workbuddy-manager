@@ -14,7 +14,10 @@ import {
   chartSpecFor,
   dailySeries,
   hourlySeries,
+  hourlyTargetFor,
+  shiftDayKey,
   todayKeyLocal,
+  yesterdayKeyLocal,
 } from './usage-chart.ts';
 
 let pass = 0;
@@ -64,6 +67,8 @@ console.log('hourlySeries：固定 24 个点');
      '第 9 小时数值正确（token 为 prompt+completion）', JSON.stringify(series[9]));
   ok(series[13].isNow === true && series[9].isNow === false, '当前小时被标记出来（UI 会高亮）');
   ok(series[10].tokens === 0 && series[10].requests === 0, '没有数据的时段是 0，不是缺格');
+  ok(series[9].credit === 1 && series[10].credit === 0,
+     '积分同样按时段归位并补 0（issue #427 趋势积分线）');
   ok(series[9].success === 2 && series[10].success === 0,
      '成功数与失败数各自独立补齐（issue #369 趋势成功线）');
   // 乱序输入也要归位
@@ -84,6 +89,7 @@ console.log('dailySeries：窗口内定长、缺的天补零');
      '窗口是「今天往前数 7 天」', `${series[0].label} … ${series[6].label}`);
   ok(series[6].tokens === 75 && series[6].failed === 3, '今天的数据对得上');
   ok(series[6].success === 4 && series[5].success === 0, '每日成功数同样按日归位并补 0');
+  ok(series[6].credit === 0 && series[5].credit === 0, '积分按日归位（该样本为 0）');
   ok(series[5].tokens === 0 && series[5].requests === 0,
      '没有请求的那天补 0（不补的话那天会从图上消失）');
   ok(series[4].tokens === 30, '中间那天有数据', JSON.stringify(series[4]));
@@ -108,6 +114,39 @@ console.log('todayKeyLocal：本地时区，不是 UTC');
   ok(todayKeyLocal(d) === '2026-09-29', '本地日期（UTC 会退到 09-28）', todayKeyLocal(d));
 }
 
+
+// ── 单日范围 → 小时端点该查哪一天 ───────────────────────────────
+console.log('hourlyTargetFor：只有单日才按小时画');
+{
+  const today = '2026-11-18';
+
+  const t1 = hourlyTargetFor({days: '1', customStart: '', customEnd: '', todayKey: today});
+  ok(t1 !== null && t1.isToday && t1.day === undefined,
+     '今日 → 查今天（日期交给后端默认）', JSON.stringify(t1));
+
+  const t2 = hourlyTargetFor({days: 'yesterday', customStart: '', customEnd: '', todayKey: today});
+  ok(t2 !== null && !t2.isToday && t2.day === '2026-11-17',
+     '昨日 → 查昨天，且不标「当前小时」', JSON.stringify(t2));
+
+  const t3 = hourlyTargetFor({days: 'custom', customStart: today, customEnd: today, todayKey: today});
+  ok(t3 !== null && t3.day === today && t3.isToday,
+     '自定义同一天 → 按小时、查那一天（这条以前是空图）', JSON.stringify(t3));
+
+  const t4 = hourlyTargetFor({days: 'custom', customStart: '2026-11-01',
+                              customEnd: '2026-11-18', todayKey: today});
+  ok(t4 === null, '自定义跨天 → 不查小时（走按天）', JSON.stringify(t4));
+
+  const t5 = hourlyTargetFor({days: '7', customStart: '', customEnd: '', todayKey: today});
+  ok(t5 === null, '近 7 天 → 不查小时', JSON.stringify(t5));
+
+  const t6 = hourlyTargetFor({days: 'custom', customStart: '', customEnd: '', todayKey: today});
+  ok(t6 === null, '自定义但没填日期 → 不查小时', JSON.stringify(t6));
+
+  ok(shiftDayKey('2026-03-01', -1) === '2026-02-28', 'shiftDayKey 跨月');
+  ok(shiftDayKey('2026-01-01', -1) === '2025-12-31', 'shiftDayKey 跨年');
+  ok(yesterdayKeyLocal(new Date(2026, 10, 18)) === '2026-11-17',
+     'yesterdayKeyLocal 按本地日期算');
+}
 if (process.exitCode) {
   console.error('\n有断言未通过');
 } else {

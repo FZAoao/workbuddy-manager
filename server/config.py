@@ -125,6 +125,20 @@ TRUSTED_PROXY_CIDRS = [
 ]
 # 是否暴露 /docs、/openapi.json、/redoc。生产环境建议关闭（默认关闭）。
 ENABLE_DOCS = _env('WB_ENABLE_DOCS', '0') == '1'
+
+# 静态前端产物（JS/CSS）未压缩时首屏可达 2 MB 量级，公网带宽有限（轻量服务器
+# 常见 3~6 Mbps）时表现为「页面很卡」。开启后文本类资源通常压到 25%~35%，
+# 实测首屏 1.98 MB -> 0.65 MB。
+#
+# 安全前提：Starlette 的 GZipMiddleware **内置跳过** `text/event-stream`，
+# 因此 /v1 的 SSE 流式响应不会被缓冲或改写（已实测验证：24 个 data 帧完整、
+# 含 [DONE]、无 content-encoding）。CPU 开销可忽略（压缩发生在静态资源首次
+# 命中，且 Etag 命中时浏览器直接续用缓存）。
+#
+# 需要关掉时设 WB_GZIP_ENABLED=0。
+GZIP_ENABLED = _env_bool('WB_GZIP_ENABLED', True)
+# 小于这个字节数的响应不压（避免给极小的 JSON / 错误体反而增大体积）。
+GZIP_MIN_SIZE = max(512, _env_int('WB_GZIP_MIN_SIZE', 1024))
 # 入站访问日志（安全页的「IP 访问日志」）是否记录**放行**的请求。
 #
 # 默认关闭：那张表的用途是安全审计（谁在扫我、谁被挡了），记全量会把信号淹没。
@@ -134,6 +148,17 @@ ENABLE_DOCS = _env('WB_ENABLE_DOCS', '0') == '1'
 #
 # 需要核对「某个 IP 到底来过什么」时临时设 1 恢复全量记录。
 AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
+# uvicorn 的逐请求 access log（容器 stdout 里 `INFO: 1.2.3.4 - "GET /..." 200`）。
+#
+# 默认关闭：容器日志会被健康检查（30s 一次）、前端轮询和静态资源请求刷屏，
+# 而真正要排查的访问信息在 DB 的两张结构化表里 —— request_logs（计量：谁、
+# 何时、用了什么账号 / 多少 token）与 ip_access_logs（安全审计：谁被拦、为什么），
+# 可在界面「请求日志 / IP 访问日志」页按条件过滤，比 stdout 逐行文本好用得多。
+# 需要临时抓包式看请求时设 WB_ACCESS_LOG=1（uvicorn.access 恢复 INFO）。
+ACCESS_LOG = _env_bool('WB_ACCESS_LOG', False)
+# 启动失败时额外打印精简的项目栈帧（默认开）。
+# 关掉只留一行异常摘要 + 修法说明，适合日志空间极紧的环境；排障时保持默认。
+STARTUP_FAILURE_STACK = _env_bool('WB_STARTUP_FAILURE_STACK', True)
 # 显式出口代理（可选，如 http://127.0.0.1:7890）。
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
@@ -183,6 +208,13 @@ SESSION_DAYS = max(1, _env_int('WB_SESSION_DAYS', 1))
 SESSION_IDLE_HOURS = _env_int('WB_SESSION_IDLE_HOURS', 12)
 COOKIE_NAME = 'wb_session'
 SECURE_COOKIE = _env('WB_SECURE_COOKIE', 'auto')  # auto | true | false
+
+# 是否允许创建**自定义形态**的密钥（issue #447）：默认关闭。
+#
+# 关闭时只有 `wbk_` + 随机串（猜不到）；打开后可以填 `sk-xxx` 这类从别的网关
+# 迁过来的存量形态，代价是安全性取决于用户填的那串东西。默认关闭是为了让
+# 「没有任何人手动打开」的部署保持原有安全预期 —— 这是显式选择加入的能力。
+KEY_CUSTOM_ENABLED = _env_bool('WB_KEY_CUSTOM_ENABLED', False)
 
 # 允许的 CORS 来源（同源部署时留空即可）
 CORS_ORIGINS = [o for o in _env('WB_CORS_ORIGINS', '').split(',') if o]

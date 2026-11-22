@@ -51,6 +51,8 @@ export interface ChartPoint {
   /** 完整标识，给 tooltip 用（小时 `2026-09-29 09:00`） */
   full: string;
   tokens: number;
+  /** 当日 / 当小时的实际扣费积分（issue #427）；与 token 差几个量级，图里走副轴 */
+  credit: number;
   requests: number;
   failed: number;
   success: number;
@@ -75,6 +77,7 @@ export function hourlySeries(points: readonly UsageHourPoint[], nowHour?: number
       label: `${pad(h)}:00`,
       full: `${p?.day ?? ''} ${pad(h)}:00`,
       tokens: (p?.prompt_tokens ?? 0) + (p?.completion_tokens ?? 0),
+      credit: p?.credit ?? 0,
       requests: p?.requests ?? 0,
       failed: p?.failed ?? 0,
       success: p?.success ?? 0,
@@ -106,6 +109,7 @@ export function dailySeries(
       label: key.slice(5),
       full: key,
       tokens: (p?.prompt_tokens ?? 0) + (p?.completion_tokens ?? 0),
+      credit: p?.credit ?? 0,
       requests: p?.requests ?? 0,
       failed: p?.failed ?? 0,
       success: p?.success ?? 0,
@@ -127,4 +131,48 @@ function utcMidnightToDayKey(ms: number): string {
 /** 本地时区的今天（`YYYY-MM-DD`）—— 与后端 day_of() 同一口径 */
 export function todayKeyLocal(now: Date = new Date()): string {
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/** `YYYY-MM-DD` 加减天数（纯日期运算，走 UTC 零点，不受夏令时影响） */
+export function shiftDayKey(key: string, delta: number): string {
+  return utcMidnightToDayKey(dayKeyToUtcMidnight(key) + delta * 86400000);
+}
+
+/** 昨天的本地日期（`YYYY-MM-DD`） */
+export function yesterdayKeyLocal(now: Date = new Date()): string {
+  return shiftDayKey(todayKeyLocal(now), -1);
+}
+
+/** 「单日」范围要按小时画图时，该查哪一天 */
+export interface HourlyTarget {
+  /** 要查的日期（`YYYY-MM-DD`）；`undefined` = 今天，由后端按本地日期兜底 */
+  day?: string;
+  /** 只有今天才在图上标「当前小时」 */
+  isToday: boolean;
+}
+
+/**
+ * 范围 → 小时端点该查哪一天；`null` 表示这个范围不该按小时画。
+ *
+ * 修的是这个现象：**自定义选同一天**时，`spanDays` 算出 1，`chartSpecFor(1)` 要小时粒度，
+ * 但小时端点原来只认 `days === '1'`（今日）——自定义走的是 `days === 'custom'`，于是
+ * `hourly` 恒为空数组，图上 24 根柱子全是 0、只剩一条贴底的线；而选跨天时它走按天分支，
+ * 一切正常。用户看到的就是「同一天不渲染、跨天正常」。
+ */
+export function hourlyTargetFor(opts: {
+  days: string;
+  customStart: string;
+  customEnd: string;
+  todayKey: string;
+}): HourlyTarget | null {
+  const {days, customStart, customEnd, todayKey} = opts;
+  if (days === '1') return {isToday: true};
+  if (days === 'yesterday') return {day: shiftDayKey(todayKey, -1), isToday: false};
+  if (days === 'custom') {
+    if (!customStart || !customEnd) return null;
+    // 起止相同 = 单日（按小时画）；不同 = 多日（按天画）
+    if (customStart !== customEnd) return null;
+    return {day: customStart, isToday: customStart === todayKey};
+  }
+  return null;
 }

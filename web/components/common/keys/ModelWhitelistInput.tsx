@@ -1,9 +1,10 @@
 'use client';
 
-import {useMemo, useState} from 'react';
+import {useMemo, useRef, useState} from 'react';
 import {Check, ChevronsUpDown, Search, X} from 'lucide-react';
 import {accountApi, modelApi} from '@/lib/api';
 import type {CatalogModel} from '@/lib/types';
+import {isFreeModel} from '@/lib/model-free';
 import type {Realm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
 import {Button} from '@/components/ui/button';
@@ -56,6 +57,9 @@ export function ModelWhitelistInput({
   const names = useMemo(() => splitNames(value), [value]);
   const [draft, setDraft] = useState('');
   const [open, setOpen] = useState(false);
+  /** 弹窗内使用时，浮层要挂进弹窗子树（issue #438） */
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(null);
   const [query, setQuery] = useState('');
   const [catalog, setCatalog] = useState<{cn: CatalogModel[]; global: CatalogModel[]; realms: Set<Realm> | null} | null>(null);
   /** 只看上游标注为「限时免费」的模型（issue #208）；tags 缺失时按不在免费目录处理 */
@@ -100,8 +104,9 @@ export function ModelWhitelistInput({
     }
   }
 
-  // 与密钥「限定版本」一致的那一组排前面：国内版密钥最可能选的是国内版模型。
-  const isFree = (m: CatalogModel) => (m.tags || []).some((tag) => tag.includes('免费'));
+  // 「限时免费」判据在 `lib/model-free.ts`：那里同时认 tags 与 `-free` 后缀
+  // （issue #446：只按 tags 判会让 `hy4flash-free` 筛不出来），并有独立测试。
+  const isFree = isFreeModel;
   const groups: {key: Realm; label: string; models: CatalogModel[]}[] = [];
   if (catalog) {
     const hasAccounts = (r: Realm) => !catalog.realms || catalog.realms.has(r);
@@ -191,11 +196,19 @@ export function ModelWhitelistInput({
           open={open}
           onOpenChange={(next) => {
             setOpen(next);
-            if (next) void ensureCatalog();
+            if (next) {
+              // Portal 落点要放进当前弹窗内容里（issue #438）：Radix Dialog 的
+              // RemoveScroll 只放行「被锁元素子树内」的滚轮，默认挂 body 的浮层
+              // 会被判为外部、滚轮被拦截（拖滚动条不受影响，所以很容易漏掉）。
+              setPortalContainer(
+                triggerRef.current?.closest('[data-slot="dialog-content"]') as HTMLElement | null);
+              void ensureCatalog();
+            }
           }}
         >
           <PopoverTrigger asChild>
             <Button
+              ref={triggerRef}
               type="button"
               variant="outline"
               size="sm"
@@ -206,7 +219,17 @@ export function ModelWhitelistInput({
               {t('keys.modelPick')}
             </Button>
           </PopoverTrigger>
-          <PopoverContent align="end" className="w-[320px] p-2">
+          <PopoverContent
+            align="end"
+            container={portalContainer}
+            // 碰撞边界必须与 Portal 落点是同一个元素（issue #454）：只改落点时
+            // Popper 仍按视口算可用空间，浮层向下展开越过弹窗底边、被
+            // DialogContent 的 overflow-hidden 整段裁掉（模型字段恰在表单末尾，
+            // 下方永远不够）。把边界指到弹窗本身，空间不够时浮层会翻到上方。
+            collisionBoundary={portalContainer}
+            collisionPadding={8}
+            className="w-[320px] p-2"
+          >
             <div className="mb-2 flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1">
               <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <input

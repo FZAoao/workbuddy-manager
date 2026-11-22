@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse
 from .. import config, db, security, upstreamsvc
 from ..iputil import client_ip
 from ..services import (
-    accountimport, credits as creditsvc, dailyplan, modelcatalog, reload, renew,
+    accountimport, accountorder, credits as creditsvc, dailyplan, modelcatalog, reload, renew,
     tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
@@ -568,6 +568,36 @@ async def list_accounts(upstream_id: int | None = Query(None),
         'auth_dir': str(base_dir or ''),
         'manageable': base_dir is not None,
     }
+
+
+@router.get('/accounts/order')
+def get_account_order(upstream_id: int | None = Query(None),
+                      user: dict = Depends(security.current_user)) -> dict:
+    """本分组的自定义顺序（uid 数组）。
+
+    只读不设管理员门槛：顺序是**共享视图**，只读用户看到的必须与改它的人一致，
+    否则同一份数据在两块屏幕上顺序不同、却说不出谁对。
+    """
+    group = _group(upstream_id)
+    return {'order': accountorder.load(group['id'])}
+
+
+@router.put('/accounts/order')
+def save_account_order(body: dict,
+                       upstream_id: int | None = Query(None),
+                       user: dict = Depends(security.require_admin)) -> dict:
+    """保存自定义顺序。限管理员：它改变的是**所有人**看到的列表顺序。
+
+    `order` 里没提到的账号不会被删/改，只是排到末尾（见 accountorder.apply）——
+    所以前端可以只提交当前可见的那几条，不必把整池 uid 都带上。
+    """
+    group = _group(upstream_id)
+    try:
+        order = accountorder.save(group['id'], (body or {}).get('order'))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user, 'save_account_order', '', f'{len(order)} 个账号')
+    return {'order': order}
 
 
 @router.get('/upstream/status')
@@ -1455,6 +1485,7 @@ def credits_snapshot(include_inactive: bool = Query(False),
 async def refresh_all_credits(
     force: bool = True,
     upstream_id: int | None = Query(None),
+    file: str | None = Query(None, description='只刷新这一个账号文件（issue #432）'),
     user: dict = Depends(security.current_user),
 ) -> dict:
     """并发查询所有账号的积分，返回 {uid: credits} 与每条是否来自缓存。
@@ -1481,6 +1512,19 @@ async def refresh_all_credits(
 
     base_dir = _require_dir(_group(upstream_id))
     accounts = wb2api.list_auth_accounts(base_dir)
+    # 直呼路由函数（测试 / 内部复用）时拿到的是 FastAPI 的 Query 哨兵，不是 str；
+    # 非字符串一律当「没传」，否则会把哨兵当成文件名去匹配（必然 404）。
+    if isinstance(file, str) and file.strip():
+        # 单账号刷新（issue #432）：账号多时只想更新某一个号的积分，
+        # 不必为它把整池都打一遍上游。文件名不在本组时按 404 处理，
+        # 不静默退化成「刷了全部」——那会让用户以为只刷新了一个。
+        wanted = str(file).strip()
+        picked = [a for a in accounts
+                  if str(a.get('file') or '') == wanted
+                  or _export_account_name(Path(str(a.get('file') or ''))) == wanted]
+        if not picked:
+            raise HTTPException(status_code=404, detail='账号不存在（可能已被删除或不在该分组）')
+        accounts = picked
     # 扇出上限（issue #161）：本接口对**全部账号**并发，而它们共用同一个 httpx
     # 连接池（借用语义见 config.http_client）。不设上限时账号一多就把池占满，
     # 排队超过 pool 超时（WB_TENCENT_TIMEOUT）即抛 PoolTimeout —— 报告人看到的
